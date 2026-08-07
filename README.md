@@ -15,19 +15,51 @@ Automação em Python/Playwright para:
 
 ## Instalação
 
+### Linux/macOS
+
 ```bash
-cd /home/fabio/tse-crm-bot
+git clone https://github.com/FabioWendel/tse-crm-bot.git
+cd tse-crm-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+### Windows PowerShell
+
+Instale o Python 3 e o Google Chrome antes.
+
+```powershell
+git clone https://github.com/FabioWendel/tse-crm-bot.git
+cd tse-crm-bot
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Se o PowerShell bloquear a ativação da venv, rode uma vez:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
 ## Uso
 
+Linux/macOS:
+
 ```bash
-cd /home/fabio/tse-crm-bot
+cd tse-crm-bot
 source .venv/bin/activate
+python crm_tse_bot.py
+```
+
+Windows PowerShell:
+
+```powershell
+cd tse-crm-bot
+.\.venv\Scripts\Activate.ps1
 python crm_tse_bot.py
 ```
 

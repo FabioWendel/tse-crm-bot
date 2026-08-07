@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,7 +24,7 @@ TSE_PROFILE_DIR = Path(__file__).with_name(".tse-chrome-profile")
 LOG_FILE = Path(__file__).with_name("consultas.csv")
 ERROR_LOG = Path(__file__).with_name("bot_error.log")
 LOG_HEADER = ["data_hora", "nome", "cpf", "mae", "nascimento", "encontrado", "irregular", "status", "comunicado", "resultado"]
-CHROME_EXECUTABLE = "/usr/bin/google-chrome"
+CHROME_EXECUTABLE = ""
 TSE_REMOTE_DEBUGGING_PORT = 9222
 
 HEADLESS = False
@@ -90,7 +92,7 @@ def main() -> None:
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             str(PROFILE_DIR),
-            executable_path=CHROME_EXECUTABLE,
+            executable_path=find_chrome_executable(),
             headless=HEADLESS,
             slow_mo=SLOW_MO_MS,
             viewport={"width": 1366, "height": 768},
@@ -548,10 +550,11 @@ def consultar_tse_manual(pessoa: Pessoa, motivo: str) -> ResultadoTse:
 
 
 def abrir_tse_no_chrome_normal():
+    chrome = find_chrome_executable()
     try:
         process = subprocess.Popen(
             [
-                CHROME_EXECUTABLE,
+                chrome,
                 f"--remote-debugging-port={TSE_REMOTE_DEBUGGING_PORT}",
                 f"--user-data-dir={TSE_PROFILE_DIR}",
                 "--no-first-run",
@@ -560,12 +563,12 @@ def abrir_tse_no_chrome_normal():
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **popen_background_kwargs(),
         )
         wait_cdp_ready()
         return process
     except OSError:
-        print(f"Nao consegui abrir {CHROME_EXECUTABLE}. Abra manualmente: {TSE_URL}")
+        print(f"Nao consegui abrir o Chrome em {chrome}. Abra manualmente: {TSE_URL}")
         return None
 
 
@@ -581,6 +584,44 @@ def wait_cdp_ready(timeout_seconds: int = 12) -> None:
         except OSError:
             time.sleep(0.4)
     raise RuntimeError("Chrome normal abriu, mas a porta de controle nao respondeu.")
+
+
+def find_chrome_executable() -> str:
+    if CHROME_EXECUTABLE:
+        return CHROME_EXECUTABLE
+
+    candidates = []
+    if sys.platform.startswith("win"):
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        candidates.extend(
+            [
+                Path(program_files) / "Google/Chrome/Application/chrome.exe",
+                Path(program_files_x86) / "Google/Chrome/Application/chrome.exe",
+                Path(local_app_data) / "Google/Chrome/Application/chrome.exe",
+            ]
+        )
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    else:
+        for binary in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(binary)
+            if found:
+                return found
+        candidates.extend([Path("/usr/bin/google-chrome"), Path("/usr/bin/chromium"), Path("/snap/bin/chromium")])
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+
+    raise RuntimeError("Nao encontrei o Google Chrome. Instale o Chrome ou configure CHROME_EXECUTABLE no inicio do script.")
+
+
+def popen_background_kwargs() -> dict:
+    if sys.platform.startswith("win"):
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 def montar_texto_crm(texto: str, status: str, comunicado: str) -> str:
