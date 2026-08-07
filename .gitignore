@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.browser-profile/
+.tse-chrome-profile/
+
+bot_error.log
+consultas*.csv
+
+.DS_Store
