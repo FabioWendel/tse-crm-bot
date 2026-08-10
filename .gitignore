@@ -6,6 +6,9 @@ __pycache__/
 .tse-chrome-profile/
 
 bot_error.log
+
+# Dados pessoais de eleitor (CPF, filiacao, endereco). Nunca versionar.
 consultas*.csv
+consultas*.xlsx
 
 .DS_Store

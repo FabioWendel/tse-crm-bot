@@ -34,6 +34,17 @@ TSE_RESPONSE_TIMEOUT_MS = 90000
 MAX_TSE_ATTEMPTS = 3
 TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
 
+# Quando o TSE responde que nao localizou o eleitor, o bot clica "Nao achei" na linha do CRM.
+# Ja quando a consulta nem chegou a acontecer (CAPTCHA indisponivel, tela travada, timeout),
+# o padrao e NAO marcar nada: falha nossa nao e ausencia de cadastro no TSE.
+# Ponha True se preferir marcar "Nao achei" tambem nesses casos.
+MARCAR_NAO_ACHEI_EM_ERRO_TECNICO = False
+
+# Pessoa com situacao irregular (cancelado, suspenso, biometria etc.) mas COM local
+# de votacao: False salva no CRM direto, True volta a pedir confirmacao no terminal.
+# O caso irregular continua sempre visivel no terminal e na coluna 'irregular' do CSV.
+CONFIRMAR_IRREGULAR = False
+
 IRREGULAR_TERMS = (
     "CANCELADO",
     "CANCELADA",
@@ -48,6 +59,23 @@ IRREGULAR_TERMS = (
     "REVISAO DE ELEITORADO",
     "REVISÃO DE ELEITORADO",
 )
+
+# Rotulos alternativos aceitos para cada motivo de inativacao, em ordem de preferencia.
+# Servem quando o texto do select do CRM nao bate exatamente com o motivo calculado.
+MOTIVO_ALTERNATIVAS = {
+    "Não quite": (
+        "Não quite com a Justiça Eleitoral",
+        "Não quite com a justiça eleitoral",
+        "Quitação eleitoral pendente",
+        "Título irregular",
+    ),
+    "Título cancelado": ("Título cancelado/suspenso", "Título suspenso", "Cancelado"),
+    "Problema na biometria": ("Biometria não coletada", "Sem biometria"),
+    "Dados inválidos": ("Dados incorretos", "Dados não conferem"),
+}
+
+# Opcoes "guarda-chuva" do select, usadas so quando nenhuma especifica casa.
+MOTIVO_GENERICO = ("OUTRO", "OUTROS", "OUTRO MOTIVO", "OUTROS MOTIVOS")
 
 CAPTCHA_SELECTORS = (
     "iframe[src*='captcha']",
@@ -86,6 +114,9 @@ class ResultadoTse:
     encontrado: bool
     precisa_tentar_de_novo: bool = False
     fechar_tse: Callable[[], None] | None = None
+    # True quando o TSE de fato respondeu (achando ou negando). False quando a
+    # consulta nao chegou a completar por CAPTCHA/timeout/tela travada.
+    resposta_do_tse: bool = True
 
 
 def main() -> None:
@@ -128,24 +159,35 @@ def main() -> None:
             append_log(pessoa, resultado)
 
             if not resultado.encontrado:
-                print("Nao encontrei local de votacao para esta pessoa. Gravei como ERRO NAO IDENTIFICADO no CSV e vou pular o CRM.")
                 fechar_tse_resultado(resultado)
+                voltar_para_pendentes(crm)
+
+                if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
+                    print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
+                    marcar_nao_achei(crm, pessoa)
+                else:
+                    print("A consulta nao chegou a completar (CAPTCHA/timeout). Gravei no CSV e deixei a linha intacta no CRM.")
+
                 voltar_para_pendentes(crm)
                 continue
 
             if resultado.irregular:
-                print("\nATENCAO: encontrei situacao/comunicado que precisa da sua decisao.")
+                print("\nATENCAO: situacao/comunicado irregular (registrado no CSV).")
                 print(f"Pessoa: {pessoa.nome} - CPF {pessoa.cpf}")
                 print(f"Status: {resultado.status or 'nao identificado'}")
                 if resultado.comunicado:
                     print(f"Comunicado: {resultado.comunicado}")
-                print("Como existe local de votacao, ele sera atualizado no CRM apos sua confirmacao.")
-                confirm = ask_user("Confira visualmente o resultado no TSE. Digite S para salvar no CRM, ou qualquer outra tecla para pular: ").strip().upper()
-                if confirm != "S":
-                    print("Pulando salvamento desta pessoa.")
-                    fechar_tse_resultado(resultado)
-                    voltar_para_pendentes(crm)
-                    continue
+
+                if CONFIRMAR_IRREGULAR:
+                    print("Como existe local de votacao, ele sera atualizado no CRM apos sua confirmacao.")
+                    confirm = ask_user("Confira visualmente o resultado no TSE. Digite S para salvar no CRM, ou qualquer outra tecla para pular: ").strip().upper()
+                    if confirm != "S":
+                        print("Pulando salvamento desta pessoa.")
+                        fechar_tse_resultado(resultado)
+                        voltar_para_pendentes(crm)
+                        continue
+                else:
+                    print("Existe local de votacao. Salvando no CRM automaticamente.")
             else:
                 print("Pessoa regular sem alerta. Salvando automaticamente no CRM.")
 
@@ -160,7 +202,7 @@ def main() -> None:
                     print("Confira/inative manualmente no CRM antes de seguir.")
             fechar_tse_resultado(resultado)
             voltar_para_pendentes(crm)
-            if resultado.irregular:
+            if resultado.irregular and CONFIRMAR_IRREGULAR:
                 ask_user("Salvei no CRM e fechei o TSE. Pressione Enter para ir para a proxima pessoa...")
             else:
                 print("Salvei no CRM e fechei o TSE. Indo para a proxima pessoa...")
@@ -495,12 +537,15 @@ def wait_tse_loading(page: Page, timeout_ms: int = 20000) -> None:
 
 
 def resultado_sem_identificacao(status: str, comunicado: str) -> ResultadoTse:
+    # So chega aqui quando a consulta nao completou (CAPTCHA, timeout, tela travada),
+    # nunca quando o TSE respondeu que nao localizou o eleitor.
     return ResultadoTse(
         texto_para_crm=f"{status}: {comunicado}",
         status=status,
         comunicado=comunicado,
         irregular=False,
         encontrado=False,
+        resposta_do_tse=False,
     )
 
 
@@ -677,6 +722,63 @@ def has_tse_negative_response(texto: str) -> bool:
     return any(term in normalized for term in negative_terms)
 
 
+def marcar_nao_achei(page: Page, pessoa: Pessoa) -> bool:
+    """Clica no botao 'Nao achei' da linha da pessoa. Nao abre modal: e um clique so."""
+    row = linha_da_pessoa(page, pessoa)
+    if row is None:
+        print(f"Nao localizei a linha de {pessoa.nome} para marcar 'Nao achei'. Confira manualmente no CRM.")
+        return False
+
+    try:
+        row.scroll_into_view_if_needed(timeout=8000)
+    except (TimeoutError, Error):
+        pass
+
+    botao = row.get_by_role("button", name=re.compile(r"N[ãa]o achei", re.I)).first
+    try:
+        botao.click(timeout=10000)
+    except (TimeoutError, Error):
+        # Fallback: em algumas telas o controle nao expoe role=button.
+        try:
+            row.get_by_text(re.compile(r"N[ãa]o achei", re.I)).first.click(timeout=8000)
+        except (TimeoutError, Error):
+            print("Nao encontrei o botao 'Nao achei' nesta linha. Confira manualmente no CRM.")
+            return False
+
+    page.wait_for_timeout(1500)
+    print("Marquei 'Nao achei' no CRM.")
+    return True
+
+
+def linha_da_pessoa(page: Page, pessoa: Pessoa):
+    """Acha a linha pelo CPF.
+
+    O indice guardado em pessoa.row_index envelhece: a tabela se reordena a cada
+    'Pendentes'. Clicar por indice desatualizado marcaria "Nao achei" na pessoa
+    errada, entao o CPF manda. So caimos no indice quando nao da para descobrir
+    qual coluna e a do CPF.
+    """
+    rows = page.locator("table tbody tr")
+    total = rows.count()
+    cpf_idx = header_indexes(page).get(normalize_header("CPF"))
+
+    if cpf_idx is not None:
+        for idx in range(total):
+            cells = rows.nth(idx).locator("td")
+            if cpf_idx >= cells.count():
+                continue
+            try:
+                if only_digits(cells.nth(cpf_idx).inner_text(timeout=5000)) == pessoa.cpf:
+                    return rows.nth(idx)
+            except (TimeoutError, Error):
+                continue
+        return None
+
+    if pessoa.row_index < total:
+        return rows.nth(pessoa.row_index)
+    return None
+
+
 def atualizar_crm(page: Page, row_index: int, texto_resultado: str) -> None:
     row = page.locator("table tbody tr").nth(row_index)
     row.get_by_role("button", name=re.compile(r"Atualizar", re.I)).click(timeout=15000)
@@ -702,13 +804,18 @@ def motivo_inativacao(resultado: ResultadoTse) -> str:
     texto = normalize_text(resultado.texto_para_crm)
     blob = " ".join((status, comunicado, texto))
 
+    # blob ja vem sem acento e em caixa alta (normalize_text), por isso os termos aqui
+    # tambem sao escritos sem acento.
     if any(term in blob for term in ("CANCELADO", "CANCELAMENTO", "SUSPENSO", "SUSPENSA", "REVISAO DE ELEITORADO")):
         return "Título cancelado"
 
-    if "BIOMETRIA" in blob and any(term in blob for term in ("NAO COLETADA", "NÃO COLETADA", "NAO COLETADO", "NÃO COLETADO")):
+    if any(term in blob for term in ("NAO QUITE", "QUITACAO ELEITORAL PENDENTE", "EM DEBITO COM A JUSTICA ELEITORAL")):
+        return "Não quite"
+
+    if "BIOMETRIA" in blob and any(term in blob for term in ("NAO COLETADA", "NAO COLETADO")):
         return "Problema na biometria"
 
-    if any(term in blob for term in ("INVALIDO", "INVÁLIDO", "INEXISTENTE")):
+    if any(term in blob for term in ("INVALIDO", "INEXISTENTE")):
         return "Dados inválidos"
 
     return ""
@@ -733,10 +840,10 @@ def inativar_cadastro_validado(page: Page, pessoa: Pessoa, motivo: str) -> None:
         pass
 
     select = page.locator("select").last
-    try:
-        select.select_option(label=motivo, timeout=10000)
-    except Error:
-        select.select_option(value=motivo, timeout=10000)
+    if not escolher_motivo(select, motivo):
+        print(f"Nao consegui selecionar o motivo '{motivo}' no CRM. Nao vou salvar a inativacao desta pessoa.")
+        click_if_visible(page, page.get_by_role("button", name=re.compile(r"Cancelar|Fechar", re.I)).last)
+        return
 
     save = page.get_by_role("button", name=re.compile(r"Salvar|Inativar|Confirmar", re.I)).last
     save.click(timeout=15000)
@@ -746,6 +853,66 @@ def inativar_cadastro_validado(page: Page, pessoa: Pessoa, motivo: str) -> None:
         print("Cliquei para salvar a inativacao, mas o modal nao fechou dentro do tempo esperado. Confira no navegador.")
     finally:
         voltar_para_pendentes(page)
+
+
+def escolher_motivo(select, motivo: str) -> bool:
+    """Casa o motivo com as opcoes que o CRM realmente oferece.
+
+    O rotulo exato varia entre telas ("Nao quite", "Nao quite com a Justica
+    Eleitoral"...), entao compara sem acento/caixa e aceita correspondencia
+    parcial antes de desistir. Nunca escolhe uma opcao arbitraria: se nada casar,
+    devolve False e quem chamou cancela o modal.
+    """
+    opcoes = []
+    for option in select.locator("option").all():
+        try:
+            rotulo = clean(option.inner_text(timeout=5000))
+        except (TimeoutError, Error):
+            continue
+        valor = option.get_attribute("value") or ""
+        if rotulo:
+            opcoes.append((rotulo, valor))
+
+    if not opcoes:
+        print("O select de motivo veio vazio.")
+        return False
+
+    candidatos = [motivo, *MOTIVO_ALTERNATIVAS.get(motivo, ())]
+    alvos = [normalize_text(c) for c in candidatos if c]
+
+    # 1a passada: rotulo identico. 2a: um contido no outro.
+    for comparar in (
+        lambda rotulo, alvo: rotulo == alvo,
+        lambda rotulo, alvo: alvo in rotulo or rotulo in alvo,
+    ):
+        for alvo in alvos:
+            for rotulo, valor in opcoes:
+                if not comparar(normalize_text(rotulo), alvo):
+                    continue
+                try:
+                    select.select_option(label=rotulo, timeout=10000)
+                except Error:
+                    if not valor:
+                        continue
+                    select.select_option(value=valor, timeout=10000)
+                print(f"Motivo selecionado no CRM: {rotulo}")
+                return True
+
+    # Ultimo recurso: cai em "Outro". Perde granularidade, mas o cadastro fica
+    # inativado em vez de passar batido.
+    for rotulo, valor in opcoes:
+        if normalize_text(rotulo) in MOTIVO_GENERICO:
+            try:
+                select.select_option(label=rotulo, timeout=10000)
+            except Error:
+                if not valor:
+                    continue
+                select.select_option(value=valor, timeout=10000)
+            print(f"Nenhuma opcao especifica para '{motivo}'. Usei '{rotulo}'.")
+            return True
+
+    print(f"Nenhuma opcao do CRM corresponde a '{motivo}'. Opcoes disponiveis: {[r for r, _ in opcoes]}")
+    return False
 
 
 def fill_search(page: Page, value: str) -> None:
