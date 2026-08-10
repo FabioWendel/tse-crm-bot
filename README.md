@@ -1,19 +1,47 @@
 # Robô CRM + TSE
 
-Automação em Python/Playwright para:
+Automação em Python/Playwright para consultar "Onde Votar" no autoatendimento
+do TSE e gravar o resultado no CRM.
 
-1. Ler nome, CPF, nome da mãe e nascimento no CRM.
-2. Consultar "Onde Votar" no autoatendimento do TSE em um Chrome separado.
-3. Esperar sua ação quando aparecer validação de robô/CAPTCHA.
-4. Salvar automaticamente no CRM quando o título estiver regular e sem alerta.
-5. Pedir confirmação quando houver título cancelado, suspenso, inválido, biometria não coletada ou outro alerta.
-6. Abrir o modal "Atualizar local de votação" no CRM, colar o resultado e salvar.
-7. Inativar automaticamente cadastros já validados quando aplicável:
-   - `Título cancelado`
-   - `Problema na biometria`
-   - `Dados inválidos`
+> Para quem só vai **operar** (não desenvolver), veja
+> [LEIA-ME-OPERADOR.md](LEIA-ME-OPERADOR.md) e use o executável pronto.
 
-## Instalação
+## O que ele faz
+
+1. Pergunta qual operador é este, quantos vão rodar em paralelo e o teto de
+   CPFs da rodada.
+2. Inventaria **todas as páginas** de "Pendentes" no CRM e separa a fatia do
+   operador por `sha1(cpf) % total`.
+3. Para cada pessoa: busca pelo CPF, lê os dados e consulta o TSE num Chrome
+   separado.
+4. Espera você resolver o CAPTCHA. **O robô não tenta burlá-lo.**
+5. Grava o local de votação no CRM, ou marca "Não achei" quando o TSE responde
+   que não localizou a pessoa.
+6. Inativa o cadastro quando aplicável: `Título cancelado`, `Não quite`,
+   `Problema na biometria`, `Dados inválidos` — caindo em "Outro" se o CRM não
+   oferecer a opção específica.
+
+Situação irregular **com** local de votação é salva automaticamente. Para voltar
+a pedir confirmação no terminal, ponha `CONFIRMAR_IRREGULAR = True`.
+
+## Execução paralela
+
+A fatia sai de `sha1(cpf) % total`, então os operadores não precisam se
+coordenar em tempo real — a divisão é idêntica em toda máquina e estável entre
+execuções. Basta todos informarem **o mesmo total** e **números diferentes**.
+
+⚠️ Só as fatias que rodarem são processadas. Combinar 10 e rodar 3 deixa ~70%
+da fila sem tratamento.
+
+Toda escrita no CRM localiza a linha **pelo CPF**, nunca pela posição na
+tabela: com vários operadores, uma linha sai de "Pendentes" a qualquer momento
+e as outras sobem — gravar por índice defasado escreveria no cadastro errado.
+
+## Desenvolvimento
+
+Pré-requisitos: Python 3.11+ e **Google Chrome instalado**. Não é preciso
+`playwright install`: o bot dirige o Chrome do sistema, não o Chromium do
+Playwright.
 
 ### Linux/macOS
 
@@ -23,12 +51,10 @@ cd tse-crm-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install chromium
+python crm_tse_bot.py
 ```
 
 ### Windows PowerShell
-
-Instale o Python 3 e o Google Chrome antes.
 
 ```powershell
 git clone https://github.com/FabioWendel/tse-crm-bot.git
@@ -36,7 +62,7 @@ cd tse-crm-bot
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m playwright install chromium
+python crm_tse_bot.py
 ```
 
 Se o PowerShell bloquear a ativação da venv, rode uma vez:
@@ -45,30 +71,84 @@ Se o PowerShell bloquear a ativação da venv, rode uma vez:
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-## Uso
-
-Linux/macOS:
-
-```bash
-cd tse-crm-bot
-source .venv/bin/activate
-python crm_tse_bot.py
-```
-
-Windows PowerShell:
+Ou dispense a ativação chamando o interpretador da venv direto:
 
 ```powershell
-cd tse-crm-bot
-.\.venv\Scripts\Activate.ps1
-python crm_tse_bot.py
+.\.venv\Scripts\python.exe crm_tse_bot.py
 ```
 
-Na primeira execução, faça login no CRM na janela que abrir. Depois volte ao terminal e pressione `Enter`.
+### Diagnóstico
 
-O robô não tenta burlar CAPTCHA. Quando o TSE pedir validação de robô, resolva manualmente no navegador e pressione `Enter` no terminal.
+```bash
+python crm_tse_bot.py --teste
+```
 
-Arquivos de sessão, logs e CSVs de consulta são ignorados pelo git para evitar subir dados pessoais.
+Checa Chrome → Playwright → abertura do navegador, sem tocar em CRM nem TSE.
 
-## Ajustes úteis
+## Gerando o pacote para os operadores
 
-Edite as constantes no começo de `crm_tse_bot.py` se precisar mudar URL, quantidade por execução ou palavras que fazem o robô parar.
+**PyInstaller não faz compilação cruzada.** O pacote de cada sistema tem de ser
+gerado naquele sistema: `.exe` no Windows, `.dmg` no macOS. Não há como
+produzir um a partir do outro.
+
+O `build.py` detecta a plataforma e faz o que couber.
+
+### Windows → `dist\CRM-TSE-Bot.exe`
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+.\.venv\Scripts\python.exe build.py
+```
+
+Sai um executável único de ~45 MB. A máquina do operador não precisa de
+Python, venv nem pip — só do Chrome.
+
+> Se o build falhar com `PermissionError` em `dist\`, é o próprio `.exe`
+> aberto. Feche-o e rode de novo.
+
+### macOS → `dist/CRM-TSE-Bot.dmg`
+
+```bash
+./.venv/bin/python -m pip install pyinstaller
+./.venv/bin/python build.py
+```
+
+O `.dmg` sai com o binário, um `CRM-TSE-Bot.command` clicável (abre o Terminal,
+onde o operador digita os números) e o LEIA-ME.
+
+O binário **não é assinado**, então o Gatekeeper bloqueia no primeiro uso. O
+operador precisa clicar com o botão direito no `.command` → **Abrir**, ou rodar:
+
+```bash
+xattr -dr com.apple.quarantine /caminho/para/CRM-TSE-Bot
+```
+
+Assinar de verdade exige conta paga de desenvolvedor Apple.
+
+> O caminho do macOS ainda **não foi executado por ninguém** — foi escrito e
+> revisado, mas a máquina de desenvolvimento é Windows. Trate a primeira
+> geração do `.dmg` como validação.
+
+## Conversor de CSV para Excel
+
+O `consultas.csv` é UTF-8, separado por vírgula e tem campos multilinha — abrir
+com duplo clique no Excel em português embaralha tudo. Para converter:
+
+```bash
+pip install openpyxl
+python csv_para_xlsx.py
+```
+
+Sai um `.xlsx` em modo tabela, com filtro e cabeçalho congelado.
+
+## Dados pessoais
+
+`consultas.csv` e `consultas.xlsx` contêm CPF, nome da mãe e endereço de
+eleitores. Estão no `.gitignore` e **não devem ser versionados nem
+compartilhados** fora do combinado com o responsável.
+
+## Ajustes
+
+As constantes no começo de `crm_tse_bot.py` controlam URLs, tempo de espera,
+teto padrão da rodada (`LIMITE_PADRAO`), confirmação de irregulares
+(`CONFIRMAR_IRREGULAR`) e o que conta como situação irregular.

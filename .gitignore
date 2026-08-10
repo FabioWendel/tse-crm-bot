@@ -12,3 +12,8 @@ consultas*.csv
 consultas*.xlsx
 
 .DS_Store
+
+# artefatos de build
+build/
+dist/
+*.spec

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
 import shutil
@@ -19,17 +20,32 @@ from playwright.sync_api import BrowserContext, Error, Page, TimeoutError, sync_
 CRM_URL = "https://juniorveloso.com.br/cadastrante/validar-local"
 TSE_URL = "https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/"
 
-PROFILE_DIR = Path(__file__).with_name(".browser-profile")
-TSE_PROFILE_DIR = Path(__file__).with_name(".tse-chrome-profile")
-LOG_FILE = Path(__file__).with_name("consultas.csv")
-ERROR_LOG = Path(__file__).with_name("bot_error.log")
+
+def pasta_base() -> Path:
+    """Pasta onde ficam CSV, log e perfis do navegador.
+
+    Empacotado com PyInstaller, __file__ aponta para a extracao temporaria
+    (_MEIxxxx), que e apagada ao sair: o CSV desapareceria a cada execucao.
+    Congelado, ancora ao lado do .exe; em desenvolvimento, ao lado do .py.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+BASE_DIR = pasta_base()
+PROFILE_DIR = BASE_DIR / ".browser-profile"
+TSE_PROFILE_DIR = BASE_DIR / ".tse-chrome-profile"
+LOG_FILE = BASE_DIR / "consultas.csv"
+ERROR_LOG = BASE_DIR / "bot_error.log"
 LOG_HEADER = ["data_hora", "nome", "cpf", "mae", "nascimento", "encontrado", "irregular", "status", "comunicado", "resultado"]
 CHROME_EXECUTABLE = ""
 TSE_REMOTE_DEBUGGING_PORT = 9222
 
 HEADLESS = False
 SLOW_MO_MS = 120
-MAX_PESSOAS = 0  # 0 = processa todas as linhas visiveis da pagina atual
+LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
+MAX_PAGINAS_INVENTARIO = 200  # trava contra paginacao infinita
 TSE_RESPONSE_TIMEOUT_MS = 90000
 MAX_TSE_ATTEMPTS = 3
 TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
@@ -120,6 +136,8 @@ class ResultadoTse:
 
 
 def main() -> None:
+    numero, total_operadores, limite = perguntar_operador()
+
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             str(PROFILE_DIR),
@@ -134,33 +152,42 @@ def main() -> None:
         crm.goto(CRM_URL, wait_until="domcontentloaded")
         ensure_crm_ready(crm)
 
-        total = total_rows(crm)
-        if total == 0:
+        todos = inventariar_pendentes(crm)
+        if not todos:
             print("Nao encontrei linhas na tabela do CRM.")
             context.close()
             return
 
-        limite = total if MAX_PESSOAS <= 0 else min(MAX_PESSOAS, total)
-        print(f"Encontrei {total} linha(s). Vou processar {limite}.")
+        fila = [p for p in todos if fatia_do_cpf(p.cpf, total_operadores) == numero]
+        print(f"\nInventario: {len(todos)} pendente(s) no total.")
+        print(f"Operador {numero} de {total_operadores}: {len(fila)} pessoa(s) na sua fatia.")
 
-        processados: set[str] = set()
-        for index in range(limite):
-            voltar_para_pendentes(crm)
-            pessoa = read_next_pending_person(crm, processados)
+        if limite > 0 and len(fila) > limite:
+            restantes = len(fila) - limite
+            fila = fila[:limite]
+            print(f"Teto de {limite}: vou processar {limite} agora e deixar {restantes} para a proxima rodada.")
+
+        if not fila:
+            print("Nenhuma pessoa caiu na sua fatia. Nada a fazer.")
+            context.close()
+            return
+
+        for index, pendente in enumerate(fila, start=1):
+            print(f"\n[{index}/{len(fila)}] Consultando {pendente.nome} - CPF {pendente.cpf}")
+
+            # Rele a linha agora: entre o inventario e este momento outro operador
+            # pode ter tratado a pessoa, e os dados podem ter mudado.
+            pessoa = abrir_pessoa_por_cpf(crm, pendente)
             if not pessoa:
-                print("Nao encontrei outra pessoa pendente legivel na tela atual.")
-                break
+                print("Essa pessoa nao esta mais em Pendentes (outro operador tratou?). Pulando.")
+                continue
 
-            processados.add(pessoa.cpf)
-
-            print(f"\n[{index + 1}/{limite}] Consultando {pessoa.nome} - CPF {pessoa.cpf}")
             resultado = consultar_tse(playwright, context, pessoa)
 
             append_log(pessoa, resultado)
 
             if not resultado.encontrado:
                 fechar_tse_resultado(resultado)
-                voltar_para_pendentes(crm)
 
                 if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
                     print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
@@ -191,7 +218,7 @@ def main() -> None:
             else:
                 print("Pessoa regular sem alerta. Salvando automaticamente no CRM.")
 
-            atualizar_crm(crm, pessoa.row_index, resultado.texto_para_crm)
+            atualizar_crm(crm, pessoa, resultado.texto_para_crm)
             motivo = motivo_inativacao(resultado)
             if motivo:
                 try:
@@ -228,6 +255,157 @@ def total_rows(page: Page) -> int:
     return page.locator("table tbody tr").count()
 
 
+def perguntar_operador() -> tuple[int, int, int]:
+    """Pergunta quem e o operador, quantos vao rodar e o teto da rodada.
+
+    A fatia sai de sha1(cpf) % total, entao os operadores nao precisam se falar:
+    a divisao e a mesma em toda maquina e estavel entre execucoes.
+    """
+    total = ler_inteiro("Quantos operadores vao rodar agora (1 = so voce)? ", minimo=1, maximo=50)
+
+    if total == 1:
+        numero = 0
+        print("Rodando sozinho: a fila inteira e sua.")
+    else:
+        numero = ler_inteiro(f"Voce e o operador numero (0 a {total - 1})? ", minimo=0, maximo=total - 1)
+        print(f"Operador {numero} de {total}.")
+        print("ATENCAO: so as fatias que forem rodadas serao processadas. Para cobrir 100%,")
+        print(f"os numeros 0 a {total - 1} precisam rodar.")
+
+    limite = ler_inteiro(
+        f"Quantos CPFs no maximo nesta rodada? [Enter = {LIMITE_PADRAO}, 0 = sem limite] ",
+        minimo=0,
+        maximo=100000,
+        padrao=LIMITE_PADRAO,
+    )
+    print("Sem teto: vou ate o fim da sua fatia." if limite == 0 else f"Teto desta rodada: {limite} CPF(s).")
+    return numero, total, limite
+
+
+def ler_inteiro(mensagem: str, minimo: int, maximo: int, padrao: int | None = None) -> int:
+    while True:
+        resposta = ask_user(mensagem).strip()
+        if not resposta and padrao is not None:
+            return padrao
+        if resposta.isdigit() and minimo <= int(resposta) <= maximo:
+            return int(resposta)
+        print(f"Valor invalido. Informe um numero inteiro entre {minimo} e {maximo}.")
+
+
+def fatia_do_cpf(cpf: str, total: int) -> int:
+    """Fatia estavel a partir do CPF.
+
+    Usa sha1 em vez de int(cpf) % total: o ultimo digito do CPF e verificador e
+    distribui mal. Medido em 166 CPFs reais, o modulo direto dava 33 pessoas para
+    uma fatia e 10 para outra; o hash ficou entre 13 e 23.
+    """
+    if total <= 1:
+        return 0
+    return int(hashlib.sha1(cpf.encode("utf-8")).hexdigest(), 16) % total
+
+
+def inventariar_pendentes(page: Page) -> list[Pessoa]:
+    """Varre TODAS as paginas de Pendentes e devolve as pessoas legiveis.
+
+    Precisa ser feito de uma vez, antes de qualquer consulta ao TSE: o fluxo
+    antigo so enxergava a pagina 1, e com fatiamento cada operador esgotaria a
+    janela visivel e pararia achando que a fila acabou.
+    """
+    voltar_para_pendentes(page)
+    maximizar_por_pagina(page)
+
+    encontrados: dict[str, Pessoa] = {}
+    for pagina in range(1, MAX_PAGINAS_INVENTARIO + 1):
+        antes = len(encontrados)
+        for row_index in range(total_rows(page)):
+            pessoa = read_person_from_row(page, row_index)
+            if pessoa:
+                encontrados.setdefault(pessoa.cpf, pessoa)
+
+        novos = len(encontrados) - antes
+        print(f"  pagina {pagina}: +{novos} pessoa(s) (total {len(encontrados)})")
+
+        if not ir_para_proxima_pagina(page):
+            break
+        if novos == 0:
+            # Paginou mas nada novo apareceu: trata como fim para nao girar em falso.
+            break
+
+    return list(encontrados.values())
+
+
+def maximizar_por_pagina(page: Page) -> None:
+    """Poe o seletor de itens por pagina no maior valor, para paginar menos."""
+    for select in page.locator("select").all():
+        try:
+            numericas = [o.strip() for o in select.locator("option").all_text_contents() if o.strip().isdigit()]
+        except (TimeoutError, Error):
+            continue
+        if len(numericas) < 2:
+            continue
+        try:
+            select.select_option(label=max(numericas, key=int), timeout=8000)
+            page.wait_for_timeout(1500)
+            print(f"Itens por pagina: {max(numericas, key=int)}")
+            return
+        except (TimeoutError, Error):
+            continue
+
+
+def ir_para_proxima_pagina(page: Page) -> bool:
+    """Avanca uma pagina. Devolve False quando nao ha proxima."""
+    candidatos = (
+        page.get_by_role("button", name=re.compile(r"^(pr[óo]xim[ao]|next|seguinte)", re.I)).first,
+        page.get_by_role("link", name=re.compile(r"^(pr[óo]xim[ao]|next|seguinte)", re.I)).first,
+        page.locator("button[aria-label*='rox' i], a[aria-label*='rox' i]").first,
+        page.locator("button, a").filter(has_text=re.compile(r"^\s*(›|»|>)\s*$")).first,
+    )
+
+    primeira_linha = texto_da_primeira_linha(page)
+    for alvo in candidatos:
+        try:
+            if not alvo.is_visible(timeout=1000) or not alvo.is_enabled(timeout=1000):
+                continue
+            alvo.click(timeout=8000)
+        except (TimeoutError, Error):
+            continue
+
+        page.wait_for_timeout(1500)
+        # Confirma que a tabela realmente mudou: botao habilitado na ultima
+        # pagina e comum e faria o laco girar sem sair do lugar.
+        if texto_da_primeira_linha(page) != primeira_linha:
+            return True
+    return False
+
+
+def texto_da_primeira_linha(page: Page) -> str:
+    try:
+        return clean(page.locator("table tbody tr").first.inner_text(timeout=5000))
+    except (TimeoutError, Error):
+        return ""
+
+
+def abrir_pessoa_por_cpf(page: Page, pendente: Pessoa) -> Pessoa | None:
+    """Filtra Pendentes pelo CPF e rele os dados da linha.
+
+    Buscar em vez de usar a posicao guardada e o que torna a execucao paralela
+    segura: a linha e achada mesmo que esteja na pagina 30, e nunca se escreve
+    numa pessoa que apenas herdou o indice de outra.
+    """
+    voltar_para_pendentes(page)
+    try:
+        fill_search(page, pendente.cpf)
+    except (TimeoutError, Error):
+        print("Nao consegui usar o campo de busca do CRM.")
+        return None
+
+    for row_index in range(total_rows(page)):
+        pessoa = read_person_from_row(page, row_index)
+        if pessoa and pessoa.cpf == pendente.cpf:
+            return pessoa
+    return None
+
+
 def read_person_from_row(page: Page, row_index: int) -> Pessoa | None:
     rows = page.locator("table tbody tr")
     if row_index >= rows.count():
@@ -254,15 +432,6 @@ def read_person_from_row(page: Page, row_index: int) -> Pessoa | None:
         return None
 
     return Pessoa(row_index=row_index, nome=nome, cpf=cpf, mae=mae, nascimento=nascimento)
-
-
-def read_next_pending_person(page: Page, processed_cpfs: set[str]) -> Pessoa | None:
-    rows_count = total_rows(page)
-    for row_index in range(rows_count):
-        pessoa = read_person_from_row(page, row_index)
-        if pessoa and pessoa.cpf not in processed_cpfs:
-            return pessoa
-    return None
 
 
 def voltar_para_pendentes(page: Page) -> None:
@@ -751,36 +920,38 @@ def marcar_nao_achei(page: Page, pessoa: Pessoa) -> bool:
 
 
 def linha_da_pessoa(page: Page, pessoa: Pessoa):
-    """Acha a linha pelo CPF.
+    """Acha a linha pelo CPF, ou None.
 
-    O indice guardado em pessoa.row_index envelhece: a tabela se reordena a cada
-    'Pendentes'. Clicar por indice desatualizado marcaria "Nao achei" na pessoa
-    errada, entao o CPF manda. So caimos no indice quando nao da para descobrir
-    qual coluna e a do CPF.
+    Nunca cai para a posicao na tabela: com varios operadores em paralelo, uma
+    linha some de Pendentes a qualquer momento e todas as outras sobem. Escrever
+    por indice defasado gravaria no cadastro errado, em silencio.
     """
     rows = page.locator("table tbody tr")
-    total = rows.count()
     cpf_idx = header_indexes(page).get(normalize_header("CPF"))
-
-    if cpf_idx is not None:
-        for idx in range(total):
-            cells = rows.nth(idx).locator("td")
-            if cpf_idx >= cells.count():
-                continue
-            try:
-                if only_digits(cells.nth(cpf_idx).inner_text(timeout=5000)) == pessoa.cpf:
-                    return rows.nth(idx)
-            except (TimeoutError, Error):
-                continue
+    if cpf_idx is None:
+        print("Nao identifiquei a coluna de CPF na tabela do CRM.")
         return None
 
-    if pessoa.row_index < total:
-        return rows.nth(pessoa.row_index)
+    for idx in range(rows.count()):
+        cells = rows.nth(idx).locator("td")
+        if cpf_idx >= cells.count():
+            continue
+        try:
+            if only_digits(cells.nth(cpf_idx).inner_text(timeout=5000)) == pessoa.cpf:
+                return rows.nth(idx)
+        except (TimeoutError, Error):
+            continue
     return None
 
 
-def atualizar_crm(page: Page, row_index: int, texto_resultado: str) -> None:
-    row = page.locator("table tbody tr").nth(row_index)
+def atualizar_crm(page: Page, pessoa: Pessoa, texto_resultado: str) -> None:
+    # Localiza pelo CPF, nunca pela posicao: com varios operadores a tabela se
+    # reordena durante a consulta ao TSE e o indice apontaria para outra pessoa.
+    row = linha_da_pessoa(page, pessoa)
+    if row is None:
+        print(f"Nao localizei a linha de {pessoa.nome} para atualizar. Nada foi gravado.")
+        return
+
     row.get_by_role("button", name=re.compile(r"Atualizar", re.I)).click(timeout=15000)
 
     try:
@@ -1087,12 +1258,80 @@ def ask_multiline_until_end() -> str:
     return "\n".join(lines)
 
 
+def pausar_antes_de_fechar() -> None:
+    """Segura a janela aberta. Clicando no .exe, ela fecharia sozinha e o
+    operador nao leria mensagem nenhuma."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        input("\nPressione Enter para fechar esta janela...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def banner() -> None:
+    print("=" * 64)
+    print(" CRM x TSE - consulta de local de votacao")
+    print("=" * 64)
+    print(f"Os arquivos ficam em: {BASE_DIR}")
+    print("  consultas.csv  - registro de tudo que foi consultado")
+    print("  bot_error.log  - detalhe do ultimo erro, se houver")
+    print()
+    print("Requisitos: Google Chrome instalado e internet.")
+    print("Voce vai precisar resolver o CAPTCHA do TSE a cada consulta.")
+    print("Para interromper a qualquer momento: feche esta janela ou Ctrl+C.")
+    print("=" * 64)
+    print()
+
+
+def autoteste() -> int:
+    """Checagem rapida do ambiente, sem tocar no CRM nem no TSE.
+
+    Serve de diagnostico quando o operador diz "nao abre": separa problema de
+    Chrome ausente de problema de empacotamento do Playwright.
+    """
+    print("1/3 Procurando o Google Chrome...")
+    try:
+        chrome = find_chrome_executable()
+    except RuntimeError as exc:
+        print(f"    FALHOU: {exc}")
+        return 1
+    print(f"    ok: {chrome}")
+
+    print("2/3 Iniciando o Playwright...")
+    try:
+        with sync_playwright() as playwright:
+            print("    ok")
+            print("3/3 Abrindo o Chrome...")
+            navegador = playwright.chromium.launch(executable_path=chrome, headless=True)
+            pagina = navegador.new_page()
+            pagina.goto("about:blank")
+            print(f"    ok: Chrome {navegador.version}")
+            navegador.close()
+    except Exception as exc:
+        print(f"    FALHOU: {type(exc).__name__}: {exc}")
+        return 1
+
+    print(f"\nTudo certo. Os arquivos serao gravados em: {BASE_DIR}")
+    return 0
+
+
 if __name__ == "__main__":
     try:
+        banner()
+        if "--teste" in sys.argv:
+            # o pause vem do finally, nao repetir aqui
+            raise SystemExit(autoteste())
         main()
+        print("\nConcluido.")
+    except KeyboardInterrupt:
+        print("\nInterrompido por voce. O que ja foi salvo continua no CRM e no CSV.")
     except Exception:
         ERROR_LOG.write_text(traceback.format_exc(), encoding="utf-8")
         print(f"\nDeu erro. Salvei o detalhe em: {ERROR_LOG}")
         print("Ultimas linhas do erro:")
         print("\n".join(ERROR_LOG.read_text(encoding="utf-8").splitlines()[-12:]))
-        raise
+        if not getattr(sys, "frozen", False):
+            raise
+    finally:
+        pausar_antes_de_fechar()
