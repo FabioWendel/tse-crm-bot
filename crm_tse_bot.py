@@ -46,6 +46,8 @@ HEADLESS = False
 SLOW_MO_MS = 120
 LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
 MAX_PAGINAS_INVENTARIO = 200  # trava contra paginacao infinita
+TENTATIVAS_POR_PESSOA = 3  # repeticoes antes de deixar a pessoa para depois
+PAUSA_ENTRE_TENTATIVAS_MS = 3000
 TSE_RESPONSE_TIMEOUT_MS = 90000
 MAX_TSE_ATTEMPTS = 3
 TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
@@ -149,10 +151,13 @@ def main() -> None:
         )
 
         crm = context.pages[0] if context.pages else context.new_page()
-        crm.goto(CRM_URL, wait_until="domcontentloaded")
+        if not ir_para(crm, CRM_URL):
+            print("Nao consegui abrir o CRM. Confira sua internet e tente de novo.")
+            context.close()
+            return
         ensure_crm_ready(crm)
 
-        todos = inventariar_pendentes(crm)
+        todos = inventariar_com_retentativa(crm)
         if not todos:
             print("Nao encontrei linhas na tabela do CRM.")
             context.close()
@@ -172,67 +177,26 @@ def main() -> None:
             context.close()
             return
 
-        for index, pendente in enumerate(fila, start=1):
-            print(f"\n[{index}/{len(fila)}] Consultando {pendente.nome} - CPF {pendente.cpf}")
+        falhas = rodar_fila(playwright, context, crm, fila, "")
 
-            # Rele a linha agora: entre o inventario e este momento outro operador
-            # pode ter tratado a pessoa, e os dados podem ter mudado.
-            pessoa = abrir_pessoa_por_cpf(crm, pendente)
-            if not pessoa:
-                print("Essa pessoa nao esta mais em Pendentes (outro operador tratou?). Pulando.")
-                continue
+        # Repasse: erro costuma ser transitorio (CRM lento, navegacao cortada,
+        # TSE fora do ar por um instante). Vale uma segunda passada antes de
+        # desistir de vez.
+        if falhas:
+            print(f"\n{'=' * 60}")
+            print(f"{len(falhas)} pessoa(s) falharam. Vou repassar essas agora.")
+            print("=" * 60)
+            falhas = rodar_fila(playwright, context, crm, falhas, "repasse ")
 
-            resultado = consultar_tse(playwright, context, pessoa)
-
-            append_log(pessoa, resultado)
-
-            if not resultado.encontrado:
-                fechar_tse_resultado(resultado)
-
-                if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
-                    print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
-                    marcar_nao_achei(crm, pessoa)
-                else:
-                    print("A consulta nao chegou a completar (CAPTCHA/timeout). Gravei no CSV e deixei a linha intacta no CRM.")
-
-                voltar_para_pendentes(crm)
-                continue
-
-            if resultado.irregular:
-                print("\nATENCAO: situacao/comunicado irregular (registrado no CSV).")
-                print(f"Pessoa: {pessoa.nome} - CPF {pessoa.cpf}")
-                print(f"Status: {resultado.status or 'nao identificado'}")
-                if resultado.comunicado:
-                    print(f"Comunicado: {resultado.comunicado}")
-
-                if CONFIRMAR_IRREGULAR:
-                    print("Como existe local de votacao, ele sera atualizado no CRM apos sua confirmacao.")
-                    confirm = ask_user("Confira visualmente o resultado no TSE. Digite S para salvar no CRM, ou qualquer outra tecla para pular: ").strip().upper()
-                    if confirm != "S":
-                        print("Pulando salvamento desta pessoa.")
-                        fechar_tse_resultado(resultado)
-                        voltar_para_pendentes(crm)
-                        continue
-                else:
-                    print("Existe local de votacao. Salvando no CRM automaticamente.")
-            else:
-                print("Pessoa regular sem alerta. Salvando automaticamente no CRM.")
-
-            atualizar_crm(crm, pessoa, resultado.texto_para_crm)
-            motivo = motivo_inativacao(resultado)
-            if motivo:
-                try:
-                    inativar_cadastro_validado(crm, pessoa, motivo)
-                except Exception:
-                    ERROR_LOG.write_text(traceback.format_exc(), encoding="utf-8")
-                    print(f"Nao consegui inativar automaticamente. Salvei o detalhe em: {ERROR_LOG}")
-                    print("Confira/inative manualmente no CRM antes de seguir.")
-            fechar_tse_resultado(resultado)
-            voltar_para_pendentes(crm)
-            if resultado.irregular and CONFIRMAR_IRREGULAR:
-                ask_user("Salvei no CRM e fechei o TSE. Pressione Enter para ir para a proxima pessoa...")
-            else:
-                print("Salvei no CRM e fechei o TSE. Indo para a proxima pessoa...")
+        print(f"\n{'=' * 60}")
+        print(f"Fim. Processadas: {len(fila) - len(falhas)}/{len(fila)}.")
+        if falhas:
+            print(f"Sem sucesso mesmo apos repasse: {len(falhas)}")
+            for pendente in falhas:
+                print(f"  - {pendente.nome} (CPF {pendente.cpf})")
+            print(f"Detalhe dos erros em: {ERROR_LOG}")
+            print("Rode o programa de novo mais tarde: quem ficou continua em Pendentes.")
+        print("=" * 60)
 
         print("\nProcesso finalizado para as linhas visiveis.")
         context.close()
@@ -247,12 +211,198 @@ def ensure_crm_ready(page: Page) -> None:
 
     print("O CRM ainda nao mostrou a tabela. Se estiver na tela de login, faca login no navegador.")
     ask_user("Depois que a tabela aparecer, pressione Enter aqui...")
-    page.goto(CRM_URL, wait_until="domcontentloaded")
-    page.get_by_role("button", name=re.compile(r"Atualizar", re.I)).first.wait_for(timeout=30000)
+    ir_para(page, CRM_URL)
+    try:
+        page.get_by_role("button", name=re.compile(r"Atualizar", re.I)).first.wait_for(timeout=30000)
+    except TimeoutError:
+        print("Segui mesmo sem ver o botao Atualizar. Se a tela nao estiver certa, feche e abra de novo.")
 
 
 def total_rows(page: Page) -> int:
     return page.locator("table tbody tr").count()
+
+
+def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa], prefixo: str) -> list[Pessoa]:
+    """Processa a fila e devolve quem NAO deu certo.
+
+    Erro numa pessoa nunca derruba as outras: cada uma e isolada, tentada mais
+    de uma vez, e o que sobra volta na lista de falhas.
+    """
+    falhas: list[Pessoa] = []
+    for index, pendente in enumerate(fila, start=1):
+        print(f"\n[{prefixo}{index}/{len(fila)}] Consultando {pendente.nome} - CPF {pendente.cpf}")
+        try:
+            if not processar_pessoa(playwright, context, crm, pendente):
+                falhas.append(pendente)
+        except NavegadorMorto:
+            # Sem navegador nao da para continuar; devolve o resto como pendente.
+            print("\nO navegador foi fechado. Encerrando.")
+            falhas.extend(fila[index - 1:])
+            break
+    return falhas
+
+
+class NavegadorMorto(RuntimeError):
+    """Contexto/navegador caiu: nao adianta tentar de novo."""
+
+
+def processar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
+    """Tenta tratar uma pessoa. True = resolvida (ou legitimamente pulada)."""
+    for tentativa in range(1, TENTATIVAS_POR_PESSOA + 1):
+        try:
+            return tratar_pessoa(playwright, context, crm, pendente)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if navegador_caiu(exc):
+                raise NavegadorMorto() from exc
+
+            registrar_erro(pendente, tentativa, exc)
+            print(f"  ERRO (tentativa {tentativa}/{TENTATIVAS_POR_PESSOA}): {resumo_erro(exc)}")
+
+            if tentativa == TENTATIVAS_POR_PESSOA:
+                print("  Desisti desta pessoa por enquanto. Ela continua em Pendentes.")
+                return False
+
+            print("  Recuperando a tela do CRM para tentar de novo...")
+            if not recuperar_crm(crm):
+                print("  Nao consegui recuperar o CRM agora.")
+                return False
+    return False
+
+
+def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
+    # Rele a linha agora: entre o inventario e este momento outro operador
+    # pode ter tratado a pessoa, e os dados podem ter mudado.
+    pessoa = abrir_pessoa_por_cpf(crm, pendente)
+    if not pessoa:
+        print("Essa pessoa nao esta mais em Pendentes (outro operador tratou?). Pulando.")
+        return True
+
+    resultado = consultar_tse(playwright, context, pessoa)
+    try:
+        append_log(pessoa, resultado)
+
+        if not resultado.encontrado:
+            if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
+                print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
+                marcar_nao_achei(crm, pessoa)
+            else:
+                print("A consulta nao chegou a completar (CAPTCHA/timeout). Gravei no CSV e deixei a linha intacta no CRM.")
+            return True
+
+        if resultado.irregular:
+            print("\nATENCAO: situacao/comunicado irregular (registrado no CSV).")
+            print(f"Pessoa: {pessoa.nome} - CPF {pessoa.cpf}")
+            print(f"Status: {resultado.status or 'nao identificado'}")
+            if resultado.comunicado:
+                print(f"Comunicado: {resultado.comunicado}")
+
+            if CONFIRMAR_IRREGULAR:
+                print("Como existe local de votacao, ele sera atualizado no CRM apos sua confirmacao.")
+                confirm = ask_user("Confira visualmente o resultado no TSE. Digite S para salvar no CRM, ou qualquer outra tecla para pular: ").strip().upper()
+                if confirm != "S":
+                    print("Pulando salvamento desta pessoa.")
+                    return True
+            else:
+                print("Existe local de votacao. Salvando no CRM automaticamente.")
+        else:
+            print("Pessoa regular sem alerta. Salvando automaticamente no CRM.")
+
+        atualizar_crm(crm, pessoa, resultado.texto_para_crm)
+
+        motivo = motivo_inativacao(resultado)
+        if motivo:
+            # Inativacao falhando nao invalida o local ja gravado: registra e segue.
+            try:
+                inativar_cadastro_validado(crm, pessoa, motivo)
+            except Exception as exc:
+                registrar_erro(pessoa, 0, exc)
+                print(f"Nao consegui inativar automaticamente: {resumo_erro(exc)}")
+                print("Confira/inative manualmente no CRM antes de seguir.")
+
+        print("Salvei no CRM. Indo para a proxima pessoa...")
+        if resultado.irregular and CONFIRMAR_IRREGULAR:
+            ask_user("Pressione Enter para ir para a proxima pessoa...")
+        return True
+    finally:
+        # Sem isto, um erro no meio deixa o Chrome do TSE aberto e a porta 9222
+        # ocupada, e a proxima pessoa se conecta na janela velha.
+        fechar_tse_resultado(resultado)
+        try:
+            voltar_para_pendentes(crm)
+        except Exception:
+            pass
+
+
+def navegador_caiu(exc: Exception) -> bool:
+    texto = normalize_text(str(exc))
+    return any(
+        marca in texto
+        for marca in (
+            "TARGET PAGE, CONTEXT OR BROWSER HAS BEEN CLOSED",
+            "BROWSER HAS BEEN CLOSED",
+            "BROWSER CLOSED",
+            "CONNECTION CLOSED",
+        )
+    )
+
+
+def resumo_erro(exc: Exception) -> str:
+    primeira_linha = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return f"{type(exc).__name__}: {primeira_linha[:160]}"
+
+
+def registrar_erro(pessoa: Pessoa, tentativa: int, exc: Exception) -> None:
+    """Acrescenta o erro ao log. Nunca grava dado pessoal: so o CPF, que e a
+    chave para reencontrar a pessoa no CRM."""
+    carimbo = datetime.now().isoformat(timespec="seconds")
+    cabecalho = f"\n{'=' * 70}\n{carimbo} | CPF {pessoa.cpf} | tentativa {tentativa}\n"
+    try:
+        with ERROR_LOG.open("a", encoding="utf-8") as arquivo:
+            arquivo.write(cabecalho)
+            arquivo.write(traceback.format_exc())
+    except OSError:
+        pass
+
+
+def recuperar_crm(page: Page) -> bool:
+    """Devolve o CRM a um estado utilizavel depois de um erro."""
+    page.wait_for_timeout(PAUSA_ENTRE_TENTATIVAS_MS)
+
+    for fechar in (
+        page.get_by_role("button", name=re.compile(r"Cancelar|Fechar", re.I)).last,
+        page.locator("[role='dialog'] button").last,
+    ):
+        click_if_visible(page, fechar)
+
+    if not ir_para(page, CRM_URL):
+        return False
+
+    try:
+        page.locator("table tbody tr").first.wait_for(timeout=20000)
+        return True
+    except (TimeoutError, Error):
+        return False
+
+
+def ir_para(page: Page, url: str, tentativas: int = 3) -> bool:
+    """page.goto com repeticao.
+
+    O CRM as vezes redireciona sozinho durante o carregamento e o Playwright
+    aborta com "interrupted by another navigation" -- erro transitorio, que
+    some ao tentar de novo.
+    """
+    for tentativa in range(1, tentativas + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            return True
+        except (TimeoutError, Error) as exc:
+            if navegador_caiu(exc):
+                raise NavegadorMorto() from exc
+            print(f"  navegacao falhou ({tentativa}/{tentativas}): {resumo_erro(exc)}")
+            page.wait_for_timeout(PAUSA_ENTRE_TENTATIVAS_MS)
+    return False
 
 
 def perguntar_operador() -> tuple[int, int, int]:
@@ -302,6 +452,26 @@ def fatia_do_cpf(cpf: str, total: int) -> int:
     if total <= 1:
         return 0
     return int(hashlib.sha1(cpf.encode("utf-8")).hexdigest(), 16) % total
+
+
+def inventariar_com_retentativa(page: Page) -> list[Pessoa]:
+    """O inventario e a base de tudo: se falhar, nao ha fila. Vale insistir."""
+    for tentativa in range(1, TENTATIVAS_POR_PESSOA + 1):
+        try:
+            encontrados = inventariar_pendentes(page)
+            if encontrados:
+                return encontrados
+            print(f"Inventario veio vazio (tentativa {tentativa}/{TENTATIVAS_POR_PESSOA}).")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if navegador_caiu(exc):
+                raise
+            print(f"Inventario falhou ({tentativa}/{TENTATIVAS_POR_PESSOA}): {resumo_erro(exc)}")
+
+        if tentativa < TENTATIVAS_POR_PESSOA:
+            recuperar_crm(page)
+    return []
 
 
 def inventariar_pendentes(page: Page) -> list[Pessoa]:
@@ -1327,10 +1497,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrompido por voce. O que ja foi salvo continua no CRM e no CSV.")
     except Exception:
-        ERROR_LOG.write_text(traceback.format_exc(), encoding="utf-8")
+        # Append, nao write: os erros de cada pessoa ja foram acumulados aqui
+        # durante a execucao e sobrescrever apagaria o historico.
+        with ERROR_LOG.open("a", encoding="utf-8") as arquivo:
+            arquivo.write(f"\n{'=' * 70}\n{datetime.now().isoformat(timespec='seconds')} | erro geral\n")
+            arquivo.write(traceback.format_exc())
         print(f"\nDeu erro. Salvei o detalhe em: {ERROR_LOG}")
         print("Ultimas linhas do erro:")
-        print("\n".join(ERROR_LOG.read_text(encoding="utf-8").splitlines()[-12:]))
+        print("\n".join(traceback.format_exc().splitlines()[-8:]))
         if not getattr(sys, "frozen", False):
             raise
     finally:
