@@ -770,7 +770,12 @@ def consultar_tse_chrome_normal(playwright, pessoa: Pessoa) -> ResultadoTse:
 
 
 def encerrar_tse(browser, chrome_process) -> None:
-    """Fecha o Chrome do TSE e libera a porta de controle."""
+    """Fecha o Chrome do TSE de verdade e libera a porta de controle.
+
+    browser.close() sobre uma conexao CDP apenas DESCONECTA -- o processo do
+    Chrome continua vivo. Era por isso que a porta seguia respondendo e a
+    consulta seguinte caia numa janela com a tela da consulta anterior.
+    """
     if browser is not None:
         try:
             browser.close()
@@ -785,6 +790,49 @@ def encerrar_tse(browser, chrome_process) -> None:
                 break
             except (OSError, subprocess.TimeoutExpired):
                 continue
+
+    if cdp_respondendo():
+        matar_chrome_do_tse()
+    esperar_porta_livre()
+
+
+def matar_chrome_do_tse() -> None:
+    """Mata os processos do Chrome abertos com o perfil do TSE.
+
+    O Chrome se ramifica em varios processos e o que o Popen segura nem sempre
+    e o que fica de pe. Filtrar pela linha de comando pega a arvore toda, e nao
+    encosta no Chrome pessoal do operador: o perfil e exclusivo deste bot.
+    """
+    alvo = str(TSE_PROFILE_DIR)
+    try:
+        if sys.platform.startswith("win"):
+            script = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                f"Where-Object {{ $_.CommandLine -like '*{alvo}*' }} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+            comando = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+        else:
+            comando = ["pkill", "-f", alvo]
+
+        subprocess.run(
+            comando,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            **popen_background_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def esperar_porta_livre(segundos: int = 10) -> bool:
+    limite = time.monotonic() + segundos
+    while time.monotonic() < limite:
+        if not cdp_respondendo():
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def cdp_respondendo() -> bool:
@@ -1102,13 +1150,14 @@ def consultar_tse_manual(pessoa: Pessoa, motivo: str) -> ResultadoTse:
 
 
 def abrir_tse_no_chrome_normal():
-    # Sobrou um Chrome de uma execucao anterior que caiu: reaproveita. Lancar
-    # outro com o mesmo user-data-dir nao criaria processo novo -- o Chrome e
-    # instancia unica por perfil -- e devolveria um handle inutil, que depois
-    # nao mataria ninguem.
+    # Cada consulta comeca numa janela nova. Reaproveitar a anterior traz junto
+    # o estado dela -- modal aberto, CAPTCHA pendente, resultado da pessoa
+    # passada -- e a consulta fica esperando uma tela que nunca vem.
     if cdp_respondendo():
-        print("Reaproveitando a janela do TSE que ja estava aberta.")
-        return None
+        print("Sobrou uma janela do TSE da consulta anterior. Fechando antes de abrir a nova...")
+        matar_chrome_do_tse()
+        if not esperar_porta_livre():
+            print("A janela antiga do TSE nao fechou. Feche-a manualmente se travar.")
 
     chrome = find_chrome_executable()
     try:
