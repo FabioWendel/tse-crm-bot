@@ -48,8 +48,16 @@ LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
 MAX_PAGINAS_INVENTARIO = 200  # trava contra paginacao infinita
 TENTATIVAS_POR_PESSOA = 3  # repeticoes antes de deixar a pessoa para depois
 PAUSA_ENTRE_TENTATIVAS_MS = 3000
-TSE_RESPONSE_TIMEOUT_MS = 90000
+TSE_RESPONSE_TIMEOUT_MS = 90000  # espera normal, sem CAPTCHA na tela
+TSE_ESPERA_CAPTCHA_MS = 180000  # prorrogacao enquanto houver CAPTCHA (voce resolvendo)
+TSE_ESPERA_MAXIMA_MS = 420000  # teto absoluto por tentativa: 7 min e desiste
 MAX_TSE_ATTEMPTS = 3
+
+# False = o programa nunca para para voce digitar no terminal. O CAPTCHA
+# continua sendo resolvido por voce no navegador; o que sai e a espera por
+# Enter. True volta ao fluxo antigo, com confirmacoes e colagem manual.
+PERGUNTAR_NO_TERMINAL = False
+ESPERA_LOGIN_MS = 600000  # 10 min para o operador logar no CRM, sem pedir Enter
 TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
 
 # Quando o TSE responde que nao localizou o eleitor, o bot clica "Nao achei" na linha do CRM.
@@ -209,13 +217,26 @@ def ensure_crm_ready(page: Page) -> None:
     except TimeoutError:
         pass
 
-    print("O CRM ainda nao mostrou a tabela. Se estiver na tela de login, faca login no navegador.")
-    ask_user("Depois que a tabela aparecer, pressione Enter aqui...")
-    ir_para(page, CRM_URL)
-    try:
-        page.get_by_role("button", name=re.compile(r"Atualizar", re.I)).first.wait_for(timeout=30000)
-    except TimeoutError:
-        print("Segui mesmo sem ver o botao Atualizar. Se a tela nao estiver certa, feche e abra de novo.")
+    print("\n>>> O CRM ainda nao mostrou a tabela.")
+    print(">>> Se estiver na tela de login, faca login na janela do navegador.")
+    print(">>> Nao precisa voltar aqui: eu sigo sozinho assim que a tabela aparecer.\n")
+
+    if PERGUNTAR_NO_TERMINAL:
+        ask_user("Depois que a tabela aparecer, pressione Enter aqui...")
+        ir_para(page, CRM_URL)
+
+    # Espera a tabela por si mesma, em vez de exigir um Enter.
+    limite = time.monotonic() + (ESPERA_LOGIN_MS / 1000)
+    while time.monotonic() < limite:
+        try:
+            page.get_by_role("button", name=re.compile(r"Atualizar", re.I)).first.wait_for(timeout=5000)
+            print("Tabela detectada. Seguindo.")
+            return
+        except (TimeoutError, Error):
+            restante = int(limite - time.monotonic())
+            print(f"  aguardando login... ({restante}s restantes)")
+
+    print("Segui mesmo sem ver a tabela. Se a tela nao estiver certa, feche e abra de novo.")
 
 
 def total_rows(page: Page) -> int:
@@ -287,9 +308,12 @@ def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pess
             if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
                 print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
                 marcar_nao_achei(crm, pessoa)
-            else:
-                print("A consulta nao chegou a completar (CAPTCHA/timeout). Gravei no CSV e deixei a linha intacta no CRM.")
-            return True
+                return True
+
+            # A consulta nem completou: nao e "nao achei", e falha nossa.
+            # Devolve False para a pessoa entrar no repasse do fim da fila.
+            print("A consulta nao chegou a completar (CAPTCHA/timeout). Fica para o repasse.")
+            return False
 
         if resultado.irregular:
             print("\nATENCAO: situacao/comunicado irregular (registrado no CSV).")
@@ -665,7 +689,7 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
                 continue
             return resultado_sem_identificacao("ERRO NAO IDENTIFICADO", "Tela do TSE ficou carregando e nao permitiu clicar em Entrar.")
 
-        if esperar_resultado_ou_acao_manual(page):
+        if esperar_resultado_tse(page):
             break
 
         if tentativa < MAX_TSE_ATTEMPTS:
@@ -673,9 +697,16 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
             print("Vou tentar a mesma pessoa novamente.")
             continue
 
-        return consultar_tse_manual(
-            pessoa,
-            "Nao veio resposta do TSE apos varias tentativas ou o CAPTCHA ficou indisponivel.",
+        if PERGUNTAR_NO_TERMINAL:
+            return consultar_tse_manual(
+                pessoa,
+                "Nao veio resposta do TSE apos varias tentativas ou o CAPTCHA ficou indisponivel.",
+            )
+
+        print("TSE nao respondeu apos todas as tentativas. Deixo esta pessoa para depois e sigo.")
+        return resultado_sem_identificacao(
+            "ERRO NAO IDENTIFICADO",
+            "TSE nao respondeu ou CAPTCHA indisponivel apos todas as tentativas.",
         )
 
     texto = clean(page.locator("body").inner_text(timeout=30000))
@@ -734,10 +765,34 @@ def abrir_onde_votar(page: Page) -> None:
         pass
 
     wait_tse_loading(page)
+    campo = page.locator("#titulo-cpf-nome").or_(
+        page.get_by_role("textbox", name=re.compile(r"título eleitoral|titulo eleitoral|CPF", re.I))
+    ).first
     try:
-        page.locator("#titulo-cpf-nome").or_(page.get_by_role("textbox", name=re.compile(r"título eleitoral|titulo eleitoral|CPF", re.I))).first.wait_for(timeout=15000)
+        campo.wait_for(timeout=15000)
+        return
     except TimeoutError:
+        pass
+
+    if PERGUNTAR_NO_TERMINAL:
         ask_user("Nao achei a tela de autenticacao do TSE. Abra 'Onde Votar' manualmente e pressione Enter...")
+        return
+
+    # Sem parar o fluxo: recarrega e tenta abrir "Onde Votar" de novo. Se ainda
+    # assim nao aparecer, quem chamou trata como tentativa perdida.
+    print("Nao achei a tela de autenticacao do TSE. Recarregando...")
+    if not ir_para(page, TSE_URL, tentativas=2):
+        return
+    wait_tse_loading(page)
+    try:
+        page.get_by_text(re.compile(r"onde votar", re.I)).first.click(timeout=8000)
+    except (TimeoutError, Error):
+        pass
+    wait_tse_loading(page)
+    try:
+        campo.wait_for(timeout=15000)
+    except TimeoutError:
+        print("A tela de autenticacao do TSE nao abriu. Sigo para a proxima tentativa.")
 
 
 def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
@@ -782,8 +837,57 @@ def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
             return False
 
 
-def esperar_resultado_ou_acao_manual(page: Page) -> bool:
+def esperar_resultado_tse(page: Page) -> bool:
+    """Espera a resposta do TSE sem pedir nada no terminal.
+
+    O CAPTCHA continua sendo resolvido por voce no navegador -- o que sai daqui
+    e a parada para digitar Enter. Enquanto houver CAPTCHA na tela, a espera e
+    prorrogada (voce pode estar resolvendo); sem CAPTCHA, vale o prazo curto.
+    Estourando o teto total, devolve False e quem chamou tenta de novo.
+    """
     print("Aguardando resposta do TSE...")
+    if PERGUNTAR_NO_TERMINAL:
+        return _esperar_resultado_interativo(page)
+
+    inicio = time.monotonic()
+    teto = inicio + (TSE_ESPERA_MAXIMA_MS / 1000)
+    deadline = inicio + (TSE_RESPONSE_TIMEOUT_MS / 1000)
+    avisou = False
+
+    while time.monotonic() < min(deadline, teto):
+        page.wait_for_timeout(1000)
+        try:
+            texto = page.locator("body").inner_text(timeout=10000)
+        except (TimeoutError, Error):
+            continue
+
+        if has_captcha_error(texto):
+            limpar_erro_captcha(page)
+            return False
+
+        if has_voting_place_result(texto) or has_tse_negative_response(texto):
+            return True
+
+        if has_captcha(page):
+            if not avisou:
+                print(">>> CAPTCHA na tela. Resolva no navegador: eu sigo sozinho depois. <<<")
+                avisou = True
+            deadline = min(time.monotonic() + (TSE_ESPERA_CAPTCHA_MS / 1000), teto)
+
+    # Ultima leitura antes de desistir: a resposta pode ter chegado no ultimo segundo.
+    try:
+        texto = page.locator("body").inner_text(timeout=10000)
+    except (TimeoutError, Error):
+        return False
+
+    if has_captcha_error(texto):
+        limpar_erro_captcha(page)
+        return False
+    return has_voting_place_result(texto) or has_tse_negative_response(texto)
+
+
+def _esperar_resultado_interativo(page: Page) -> bool:
+    """Comportamento antigo, com paradas no terminal. So com PERGUNTAR_NO_TERMINAL."""
     deadline = time.monotonic() + (TSE_RESPONSE_TIMEOUT_MS / 1000)
 
     while time.monotonic() < deadline:
