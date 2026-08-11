@@ -50,7 +50,8 @@ TENTATIVAS_POR_PESSOA = 3  # repeticoes antes de deixar a pessoa para depois
 PAUSA_ENTRE_TENTATIVAS_MS = 3000
 TSE_RESPONSE_TIMEOUT_MS = 90000  # espera normal, sem CAPTCHA na tela
 TSE_ESPERA_CAPTCHA_MS = 180000  # prorrogacao enquanto houver CAPTCHA (voce resolvendo)
-TSE_ESPERA_MAXIMA_MS = 420000  # teto absoluto por tentativa: 7 min e desiste
+TSE_ESPERA_MAXIMA_MS = 240000  # teto por tentativa: 4 min e reinicia a consulta
+TEMPO_MAXIMO_POR_PESSOA_MS = 600000  # teto por pessoa: 10 min e vai para a proxima
 MAX_TSE_ATTEMPTS = 3
 
 # False = o programa nunca para para voce digitar no terminal. O CAPTCHA
@@ -678,10 +679,21 @@ def consultar_tse(playwright, context: BrowserContext, pessoa: Pessoa) -> Result
 
 
 def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
+    # Teto absoluto: nenhuma pessoa pode consumir a execucao inteira. Sem isto,
+    # 3 tentativas x espera longa de CAPTCHA travariam a fila por muito tempo.
+    prazo_final = time.monotonic() + (TEMPO_MAXIMO_POR_PESSOA_MS / 1000)
 
     for tentativa in range(1, MAX_TSE_ATTEMPTS + 1):
+        if time.monotonic() > prazo_final:
+            print("Tempo maximo desta pessoa esgotado. Deixo para o repasse e sigo.")
+            return resultado_sem_identificacao(
+                "ERRO NAO IDENTIFICADO",
+                "Tempo maximo por pessoa esgotado (CAPTCHA nao resolvido ou TSE lento).",
+            )
+
         print(f"Tentativa TSE {tentativa}/{MAX_TSE_ATTEMPTS}")
-        page.goto(TSE_URL, wait_until="domcontentloaded")
+        if not ir_para(page, TSE_URL, tentativas=2):
+            continue
         abrir_onde_votar(page)
         if not preencher_autenticacao(page, pessoa):
             if tentativa < MAX_TSE_ATTEMPTS:
@@ -689,7 +701,7 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
                 continue
             return resultado_sem_identificacao("ERRO NAO IDENTIFICADO", "Tela do TSE ficou carregando e nao permitiu clicar em Entrar.")
 
-        if esperar_resultado_tse(page):
+        if esperar_resultado_tse(page, prazo_final):
             break
 
         if tentativa < MAX_TSE_ATTEMPTS:
@@ -735,26 +747,56 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
 
 
 def consultar_tse_chrome_normal(playwright, pessoa: Pessoa) -> ResultadoTse:
-    chrome_process = abrir_tse_no_chrome_normal()
-    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}")
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.pages[-1] if context.pages else context.new_page()
-    page.goto(TSE_URL, wait_until="domcontentloaded")
-    resultado = consultar_tse_playwright_page(page, pessoa)
+    chrome_process = None
+    browser = None
+    try:
+        chrome_process = abrir_tse_no_chrome_normal()
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}")
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[-1] if context.pages else context.new_page()
+        if not ir_para(page, TSE_URL, tentativas=2):
+            raise RuntimeError("Nao consegui abrir a pagina do TSE.")
+        resultado = consultar_tse_playwright_page(page, pessoa)
+    except BaseException:
+        # Sem isto, uma excecao aqui deixava o Chrome do TSE aberto para sempre:
+        # o fechar_tse so era anexado ao resultado na saida bem-sucedida. A cada
+        # falha sobrava mais uma janela segurando a porta 9222, e a pessoa
+        # seguinte se conectava na consulta velha.
+        encerrar_tse(browser, chrome_process)
+        raise
 
-    def fechar() -> None:
+    resultado.fechar_tse = lambda: encerrar_tse(browser, chrome_process)
+    return resultado
+
+
+def encerrar_tse(browser, chrome_process) -> None:
+    """Fecha o Chrome do TSE e libera a porta de controle."""
+    if browser is not None:
         try:
             browser.close()
-        except Error:
+        except (Error, OSError):
             pass
-        if chrome_process:
-            try:
-                chrome_process.terminate()
-            except OSError:
-                pass
 
-    resultado.fechar_tse = fechar
-    return resultado
+    if chrome_process is not None:
+        for encerrar in (chrome_process.terminate, chrome_process.kill):
+            try:
+                encerrar()
+                chrome_process.wait(timeout=5)
+                break
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+
+
+def cdp_respondendo() -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}/json/version", timeout=1
+        ):
+            return True
+    except OSError:
+        return False
 
 
 def abrir_onde_votar(page: Page) -> None:
@@ -796,6 +838,16 @@ def abrir_onde_votar(page: Page) -> None:
 
 
 def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
+    # Campo que nao aparece e falha desta tentativa, nao da execucao: devolve
+    # False e o laco de tentativas do TSE recomeca com a pagina recarregada.
+    try:
+        return _preencher_autenticacao(page, pessoa)
+    except RuntimeError as exc:
+        print(f"  autenticacao do TSE falhou: {resumo_erro(exc)}")
+        return False
+
+
+def _preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
     wait_tse_loading(page)
     fill_first_locator(
         page,
@@ -837,7 +889,7 @@ def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
             return False
 
 
-def esperar_resultado_tse(page: Page) -> bool:
+def esperar_resultado_tse(page: Page, prazo_final: float | None = None) -> bool:
     """Espera a resposta do TSE sem pedir nada no terminal.
 
     O CAPTCHA continua sendo resolvido por voce no navegador -- o que sai daqui
@@ -851,14 +903,26 @@ def esperar_resultado_tse(page: Page) -> bool:
 
     inicio = time.monotonic()
     teto = inicio + (TSE_ESPERA_MAXIMA_MS / 1000)
+    if prazo_final is not None:
+        teto = min(teto, prazo_final)
     deadline = inicio + (TSE_RESPONSE_TIMEOUT_MS / 1000)
     avisou = False
+    leituras_falhas = 0
 
     while time.monotonic() < min(deadline, teto):
         page.wait_for_timeout(1000)
         try:
             texto = page.locator("body").inner_text(timeout=10000)
-        except (TimeoutError, Error):
+            leituras_falhas = 0
+        except (TimeoutError, Error) as exc:
+            if navegador_caiu(exc):
+                raise NavegadorMorto() from exc
+            # Pagina ilegivel por muito tempo seguido: recomeca a tentativa em
+            # vez de girar aqui ate o teto.
+            leituras_falhas += 1
+            if leituras_falhas >= 15:
+                print("  Nao consigo ler a pagina do TSE. Vou reiniciar a consulta.")
+                return False
             continue
 
         if has_captcha_error(texto):
@@ -1038,6 +1102,14 @@ def consultar_tse_manual(pessoa: Pessoa, motivo: str) -> ResultadoTse:
 
 
 def abrir_tse_no_chrome_normal():
+    # Sobrou um Chrome de uma execucao anterior que caiu: reaproveita. Lancar
+    # outro com o mesmo user-data-dir nao criaria processo novo -- o Chrome e
+    # instancia unica por perfil -- e devolveria um handle inutil, que depois
+    # nao mataria ninguem.
+    if cdp_respondendo():
+        print("Reaproveitando a janela do TSE que ja estava aberta.")
+        return None
+
     chrome = find_chrome_executable()
     try:
         process = subprocess.Popen(
