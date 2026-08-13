@@ -1378,8 +1378,9 @@ def motivo_inativacao(resultado: ResultadoTse) -> str:
     if any(term in blob for term in ("NAO QUITE", "QUITACAO ELEITORAL PENDENTE", "EM DEBITO COM A JUSTICA ELEITORAL")):
         return "Não quite"
 
-    if "BIOMETRIA" in blob and any(term in blob for term in ("NAO COLETADA", "NAO COLETADO")):
-        return "Problema na biometria"
+    # Biometria nao coletada ou desatualizada NAO inativa: o titulo segue
+    # regular e a pessoa vota normalmente. O comunicado continua registrado no
+    # CSV para quem quiser acompanhar, mas o cadastro fica ativo.
 
     if any(term in blob for term in ("INVALIDO", "INEXISTENTE")):
         return "Dados inválidos"
