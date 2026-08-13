@@ -129,6 +129,43 @@ Assinar de verdade exige conta paga de desenvolvedor Apple.
 > revisado, mas a máquina de desenvolvimento é Windows. Trate a primeira
 > geração do `.dmg` como validação.
 
+## Relatório e separação de listas
+
+Analisa o `consultas.csv` e separa as pessoas por situação. Roda em **qualquer
+máquina** que tenha o repositório e um `consultas.csv` — não acessa CRM, TSE
+nem rede.
+
+```bash
+python relatorio_consultas.py                  # usa ./consultas.csv
+python relatorio_consultas.py outra/pasta.csv  # usa outro arquivo
+```
+
+Ele importa as regras do próprio `crm_tse_bot`, então a classificação nunca
+diverge do que o robô faria hoje. Gera três arquivos ao lado do CSV de origem:
+
+| Arquivo | Conteúdo |
+|---|---|
+| `consultas-reativar-biometria.csv` | inativados pela regra antiga de biometria, que hoje devem ficar **ativos** |
+| `consultas-inativar.csv` | quem as regras atuais mandam inativar |
+| `consultas-nao-encontrados.csv` | quem o TSE não localizou |
+
+Quando a mesma pessoa aparece mais de uma vez no CSV, vale a consulta mais
+recente.
+
+> Os três saem no padrão `consultas*.csv`, coberto pelo `.gitignore`. Têm CPF e
+> nome: não versione nem compartilhe fora do combinado.
+
+### Sobre a lista de reativação
+
+Biometria não coletada ou desatualizada **deixou de inativar** o cadastro — o
+título segue regular e a pessoa vota normalmente. Quem já tinha sido inativado
+por essa regra precisa voltar a ativo, e é isso que a lista separa.
+
+A reativação é manual, pela tela do CRM: o bot só sabe inativar. Fazer por
+`UPDATE` direto no banco esbarra na constraint `chk_pessoa_ativa_whatsapp`
+(pessoa ativa exige WhatsApp normalizado) e pula a trilha de auditoria que o
+CRM mantém.
+
 ## Conversor de CSV para Excel
 
 O `consultas.csv` é UTF-8, separado por vírgula e tem campos multilinha — abrir
