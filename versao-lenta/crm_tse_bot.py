@@ -5,7 +5,6 @@ import hashlib
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from playwright.sync_api import BrowserContext, Error, Page, TimeoutError, sync_playwright
+from chrome_normal import ContextoChromeNormal, abrir_chrome_normal
 
 
 CRM_URL = "https://juniorveloso.com.br/cadastrante/validar-local"
@@ -34,17 +34,32 @@ def pasta_base() -> Path:
 
 
 BASE_DIR = pasta_base()
-TSE_NAVEGADOR = os.environ.get("TSE_NAVEGADOR", "chrome").strip().lower()
+TSE_NAVEGADOR = os.environ.get("TSE_NAVEGADOR", "brave").strip().lower()
 PROFILE_DIR = BASE_DIR / ".browser-profile"
-TSE_PROFILE_DIR = BASE_DIR / (".tse-brave-profile" if TSE_NAVEGADOR == "brave" else ".tse-chrome-profile")
+TSE_PROFILE_DIR = BASE_DIR / {
+    "brave": ".tse-brave-profile",
+    "edge": ".tse-edge-profile",
+    "chrome": ".tse-chrome-profile",
+}.get(TSE_NAVEGADOR, ".tse-browser-profile")
 LOG_FILE = BASE_DIR / "consultas.csv"
 ERROR_LOG = BASE_DIR / "bot_error.log"
 LOG_HEADER = ["data_hora", "nome", "cpf", "mae", "nascimento", "encontrado", "irregular", "status", "comunicado", "resultado"]
 CHROME_EXECUTABLE = ""
-TSE_REMOTE_DEBUGGING_PORT = 9226 if TSE_NAVEGADOR == "brave" else 9222
+TSE_REMOTE_DEBUGGING_PORT = {"chrome": 9223, "edge": 9224, "brave": 9225}.get(TSE_NAVEGADOR, 9225)
 
 HEADLESS = False
-SLOW_MO_MS = 120
+SLOW_MO_MS = 250  # CRM: tempo adicional entre operacoes
+TSE_SLOW_MO_MS = 500
+TSE_DIGITACAO_MS = 220  # intervalo fixo entre caracteres, sem disfarcar automacao
+TSE_PAUSA_APOS_CLIQUE_MS = 500
+TSE_PAUSA_ENTRE_CAMPOS_MS = 2500
+TSE_PAUSA_ANTES_ENVIAR_MS = 5000
+TSE_INTERVALO_ENTRE_CONSULTAS_MS = 30000
+TSE_PAUSA_REPETICAO_MS = 60000  # 60 s antes da segunda, 120 s antes da terceira
+CRM_PERFIL_LIMPO = False  # preserva cookies e login no perfil desta versao
+TSE_PERFIL_LIMPO = False  # preserva o perfil entre consultas e execucoes
+REPASSAR_FALHAS_AUTOMATICAMENTE = False
+_PROXIMA_CONSULTA_TSE = 0.0
 LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
 MAX_PAGINAS_INVENTARIO = 200  # trava contra paginacao infinita
 TENTATIVAS_POR_PESSOA = 3  # repeticoes antes de deixar a pessoa para depois
@@ -60,7 +75,8 @@ MAX_TSE_ATTEMPTS = 3
 # Enter. True volta ao fluxo antigo, com confirmacoes e colagem manual.
 PERGUNTAR_NO_TERMINAL = False
 ESPERA_LOGIN_MS = 600000  # 10 min para o operador logar no CRM, sem pedir Enter
-TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
+# TSE: Chrome ou Edge aberto via subprocess; controle conectado por CDP.
+# Nao usa o perfil pessoal nem alteracoes de fingerprint. CRM continua no Playwright.
 
 # Quando o TSE responde que nao localizou o eleitor, o bot clica "Nao achei" na linha do CRM.
 # Ja quando a consulta nem chegou a acontecer (CAPTCHA indisponivel, tela travada, timeout),
@@ -152,74 +168,120 @@ class ResultadoTse:
     resposta_do_tse: bool = True
 
 
-_TSE_BROWSER = None
-_TSE_PROCESS = None
-_TSE_CONTEXT = None
+def abrir_contexto_navegador(playwright, *, tse: bool) -> BrowserContext | ContextoChromeNormal:
+    """Abre o navegador instalado com o perfil persistente exclusivo desta versao.
+
+    So usa perfil temporario se a opcao PERFIL_LIMPO for explicitamente ativada.
+    Nao apaga, copia ou abre o perfil pessoal nem os perfis da versao original.
+    """
+    limpo = TSE_PERFIL_LIMPO if tse else CRM_PERFIL_LIMPO
+    perfil = TSE_PROFILE_DIR if tse else PROFILE_DIR
+    if tse:
+        return abrir_chrome_normal(
+            playwright,
+            executable_path=find_tse_executable(),
+            profile_dir=perfil,
+            clean=limpo,
+            slow_mo=TSE_SLOW_MO_MS,
+            headless=HEADLESS,
+            port=TSE_REMOTE_DEBUGGING_PORT,
+        )
+    return playwright.chromium.launch_persistent_context(
+        "" if limpo else str(perfil),
+        executable_path=find_chrome_executable(),
+        headless=HEADLESS,
+        slow_mo=TSE_SLOW_MO_MS if tse else SLOW_MO_MS,
+        viewport={"width": 1366, "height": 768},
+        args=["--start-maximized"],
+        accept_downloads=False,
+    )
+
+
+def aguardar_pausa(page: Page, milissegundos: float, prazo_final: float | None = None) -> bool:
+    """Espera em blocos curtos, mantendo eventos e Ctrl+C responsivos."""
+    fim = time.monotonic() + max(0, milissegundos) / 1000
+    if prazo_final is not None and fim >= prazo_final:
+        return False
+    while True:
+        restante = fim - time.monotonic()
+        if restante <= 0:
+            return True
+        page.wait_for_timeout(min(1000, restante * 1000))
 
 
 def main() -> None:
     numero, total_operadores, limite = perguntar_operador()
 
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
-            executable_path=find_chrome_executable(),
-            headless=HEADLESS,
-            slow_mo=SLOW_MO_MS,
-            viewport={"width": 1366, "height": 768},
-            args=["--start-maximized"],
-        )
+        context = abrir_contexto_navegador(playwright, tse=False)
+        tse_context = None
+        try:
+            crm = context.pages[0] if context.pages else context.new_page()
+            if not ir_para(crm, CRM_URL):
+                print("Nao consegui abrir o CRM. Confira sua internet e tente de novo.")
+                return
+            ensure_crm_ready(crm)
 
-        crm = context.pages[0] if context.pages else context.new_page()
-        if not ir_para(crm, CRM_URL):
-            print("Nao consegui abrir o CRM. Confira sua internet e tente de novo.")
-            context.close()
-            return
-        ensure_crm_ready(crm)
+            todos = inventariar_com_retentativa(crm)
+            if not todos:
+                print("Nao encontrei linhas na tabela do CRM.")
+                return
 
-        todos = inventariar_com_retentativa(crm)
-        if not todos:
-            print("Nao encontrei linhas na tabela do CRM.")
-            context.close()
-            return
+            fila = [p for p in todos if fatia_do_cpf(p.cpf, total_operadores) == numero]
+            print(f"\nInventario: {len(todos)} pendente(s) no total.")
+            print(f"Operador {numero} de {total_operadores}: {len(fila)} pessoa(s) na sua fatia.")
 
-        fila = [p for p in todos if fatia_do_cpf(p.cpf, total_operadores) == numero]
-        print(f"\nInventario: {len(todos)} pendente(s) no total.")
-        print(f"Operador {numero} de {total_operadores}: {len(fila)} pessoa(s) na sua fatia.")
+            if limite > 0 and len(fila) > limite:
+                restantes = len(fila) - limite
+                fila = fila[:limite]
+                print(f"Teto de {limite}: vou processar {limite} agora e deixar {restantes} para a proxima rodada.")
 
-        if limite > 0 and len(fila) > limite:
-            restantes = len(fila) - limite
-            fila = fila[:limite]
-            print(f"Teto de {limite}: vou processar {limite} agora e deixar {restantes} para a proxima rodada.")
+            if not fila:
+                print("Nenhuma pessoa caiu na sua fatia. Nada a fazer.")
+                return
 
-        if not fila:
-            print("Nenhuma pessoa caiu na sua fatia. Nada a fazer.")
-            context.close()
-            return
+            print("\nAbrindo uma unica sessao persistente do TSE para toda a rodada...")
+            try:
+                tse_context = abrir_contexto_navegador(playwright, tse=True)
+            except RuntimeError as exc:
+                mensagem = normalize_text(str(exc))
+                if "PORTA LOCAL" in mensagem or "PERFIL PODE ESTAR EM USO" in mensagem:
+                    print("\nNao iniciei a rodada: ja existe uma execucao/janela do TSE usando este perfil.")
+                    print("Feche a janela do TSE e o terminal da execucao anterior; depois abra o INICIAR.cmd novamente.")
+                    print("Nenhuma pessoa desta rodada foi consultada ou salva no CRM.")
+                    return
+                raise
+            tse_page = pagina_tse(tse_context)
+            if not ir_para(tse_page, TSE_URL, tentativas=2):
+                raise RuntimeError("Nao consegui abrir a pagina inicial do TSE.")
+            print("Sessao do TSE pronta. Ela permanecera aberta ate o fim da rodada.")
 
-        falhas = rodar_fila(playwright, context, crm, fila, "")
+            falhas = rodar_fila(playwright, context, crm, tse_context, fila, "")
 
-        # Repasse: erro costuma ser transitorio (CRM lento, navegacao cortada,
-        # TSE fora do ar por um instante). Vale uma segunda passada antes de
-        # desistir de vez.
-        if falhas:
+            # Repasse: erro costuma ser transitorio (CRM lento, navegacao cortada,
+            # TSE fora do ar por um instante). Vale uma segunda passada antes de
+            # desistir de vez.
+            if falhas and REPASSAR_FALHAS_AUTOMATICAMENTE:
+                print(f"\n{'=' * 60}")
+                print(f"{len(falhas)} pessoa(s) falharam. Vou repassar essas agora.")
+                print("=" * 60)
+                falhas = rodar_fila(playwright, context, crm, tse_context, falhas, "repasse ")
+
             print(f"\n{'=' * 60}")
-            print(f"{len(falhas)} pessoa(s) falharam. Vou repassar essas agora.")
+            print(f"Fim. Processadas: {len(fila) - len(falhas)}/{len(fila)}.")
+            if falhas:
+                print(f"Pendentes para outra rodada: {len(falhas)}")
+                for pendente in falhas:
+                    print(f"  - {pendente.nome} (CPF {pendente.cpf})")
+                print(f"Detalhe dos erros em: {ERROR_LOG}")
+                print("Rode o programa de novo mais tarde: quem ficou continua em Pendentes.")
             print("=" * 60)
-            falhas = rodar_fila(playwright, context, crm, falhas, "repasse ")
 
-        print(f"\n{'=' * 60}")
-        print(f"Fim. Processadas: {len(fila) - len(falhas)}/{len(fila)}.")
-        if falhas:
-            print(f"Sem sucesso mesmo apos repasse: {len(falhas)}")
-            for pendente in falhas:
-                print(f"  - {pendente.nome} (CPF {pendente.cpf})")
-            print(f"Detalhe dos erros em: {ERROR_LOG}")
-            print("Rode o programa de novo mais tarde: quem ficou continua em Pendentes.")
-        print("=" * 60)
-
-        print("\nProcesso finalizado para as linhas visiveis.")
-        context.close()
+            print("\nProcesso finalizado para as linhas visiveis.")
+        finally:
+            if tse_context is not None:
+                tse_context.close()
+            context.close()
 
 
 def ensure_crm_ready(page: Page) -> None:
@@ -255,7 +317,7 @@ def total_rows(page: Page) -> int:
     return page.locator("table tbody tr").count()
 
 
-def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa], prefixo: str) -> list[Pessoa]:
+def rodar_fila(playwright, context: BrowserContext, crm: Page, tse_context, fila: list[Pessoa], prefixo: str) -> list[Pessoa]:
     """Processa a fila e devolve quem NAO deu certo.
 
     Erro numa pessoa nunca derruba as outras: cada uma e isolada, tentada mais
@@ -265,7 +327,7 @@ def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa
     for index, pendente in enumerate(fila, start=1):
         print(f"\n[{prefixo}{index}/{len(fila)}] Consultando {pendente.nome} - CPF {pendente.cpf}")
         try:
-            if not processar_pessoa(playwright, context, crm, pendente):
+            if not processar_pessoa(playwright, context, crm, tse_context, pendente):
                 falhas.append(pendente)
         except NavegadorMorto:
             # Sem navegador nao da para continuar; devolve o resto como pendente.
@@ -279,11 +341,11 @@ class NavegadorMorto(RuntimeError):
     """Contexto/navegador caiu: nao adianta tentar de novo."""
 
 
-def processar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
+def processar_pessoa(playwright, context: BrowserContext, crm: Page, tse_context, pendente: Pessoa) -> bool:
     """Tenta tratar uma pessoa. True = resolvida (ou legitimamente pulada)."""
     for tentativa in range(1, TENTATIVAS_POR_PESSOA + 1):
         try:
-            return tratar_pessoa(playwright, context, crm, pendente)
+            return tratar_pessoa(playwright, context, crm, tse_context, pendente)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -304,7 +366,7 @@ def processar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: P
     return False
 
 
-def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
+def tratar_pessoa(playwright, context: BrowserContext, crm: Page, tse_context, pendente: Pessoa) -> bool:
     # Rele a linha agora: entre o inventario e este momento outro operador
     # pode ter tratado a pessoa, e os dados podem ter mudado.
     pessoa = abrir_pessoa_por_cpf(crm, pendente)
@@ -312,8 +374,9 @@ def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pess
         print("Essa pessoa nao esta mais em Pendentes (outro operador tratou?). Pulando.")
         return True
 
-    resultado = consultar_tse(playwright, context, pessoa)
+    resultado = None
     try:
+        resultado = consultar_tse(playwright, context, pessoa, tse_context)
         append_log(pessoa, resultado)
 
         if not resultado.encontrado:
@@ -362,9 +425,10 @@ def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pess
             ask_user("Pressione Enter para ir para a proxima pessoa...")
         return True
     finally:
-        # A sessao do navegador do TSE e compartilhada pela rodada; o resultado
-        # individual nao deve fechar o processo.
-        fechar_tse_resultado(resultado)
+        # Mantem a mesma janela/sessao e volta ao inicio para a proxima pessoa.
+        if resultado is not None:
+            fechar_tse_resultado(resultado)
+        voltar_tse_para_home(tse_context)
         try:
             voltar_para_pendentes(crm)
         except Exception:
@@ -678,15 +742,17 @@ def header_indexes(page: Page) -> dict[str, int]:
     return headers
 
 
-def consultar_tse(playwright, context: BrowserContext, pessoa: Pessoa) -> ResultadoTse:
-    if TSE_NO_CHROME_NORMAL:
-        return consultar_tse_chrome_normal(playwright, pessoa)
-
-    page = context.new_page()
+def consultar_tse(playwright, context: BrowserContext, pessoa: Pessoa, tse_context=None) -> ResultadoTse:
+    global _PROXIMA_CONSULTA_TSE
+    restante = max(0, _PROXIMA_CONSULTA_TSE - time.monotonic())
+    if restante:
+        print(f"Pausa entre consultas: {restante:.0f} segundo(s).")
+        aguardar_pausa(context.pages[0], restante * 1000)
     try:
-        return consultar_tse_playwright_page(page, pessoa)
+        return consultar_tse_chrome_normal(playwright, pessoa, tse_context)
     finally:
-        page.close()
+        # Tambem vale para excecoes, repeticoes externas e o repasse opcional.
+        _PROXIMA_CONSULTA_TSE = time.monotonic() + TSE_INTERVALO_ENTRE_CONSULTAS_MS / 1000
 
 
 def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
@@ -695,6 +761,13 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
     prazo_final = time.monotonic() + (TEMPO_MAXIMO_POR_PESSOA_MS / 1000)
 
     for tentativa in range(1, MAX_TSE_ATTEMPTS + 1):
+        if tentativa > 1:
+            pausa = TSE_PAUSA_REPETICAO_MS * (2 ** (tentativa - 2))
+            print(f"Aguardando {pausa / 1000:.0f} s antes de repetir a consulta.")
+            if not aguardar_pausa(page, pausa, prazo_final):
+                return resultado_sem_identificacao(
+                    "ERRO NAO IDENTIFICADO", "Sem tempo restante para outra tentativa com pausa."
+                )
         if time.monotonic() > prazo_final:
             print("Tempo maximo desta pessoa esgotado. Deixo para o repasse e sigo.")
             return resultado_sem_identificacao(
@@ -703,8 +776,10 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
             )
 
         print(f"Tentativa TSE {tentativa}/{MAX_TSE_ATTEMPTS}")
-        if not ir_para(page, TSE_URL, tentativas=2):
+        if not ir_para(page, TSE_URL, tentativas=1):
             continue
+        # A home pode continuar autenticada no eleitor anterior mesmo depois
+        # de fechar o modal do resultado. Nunca inicia outra consulta assim.
         if eleitor_tse_autenticado(page) and not desautenticar_eleitor_tse(page):
             print("O perfil do eleitor anterior continuou ativo. Nao vou consultar nem salvar outra pessoa nesta tentativa.")
             continue
@@ -735,12 +810,8 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
         )
 
     else:
-        # Todas as tentativas podem terminar em ``continue`` (por exemplo, se
-        # o perfil anterior continuar autenticado). Nessa situacao nao existe
-        # uma resposta valida do TSE para gravar no CRM.
         return resultado_sem_identificacao(
-            "ERRO NAO IDENTIFICADO",
-            "Nao foi possivel completar a consulta apos as tentativas.",
+            "ERRO NAO IDENTIFICADO", "Nao foi possivel completar a consulta apos as tentativas."
         )
 
     texto = clean(page.locator("body").inner_text(timeout=30000))
@@ -773,39 +844,36 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
     )
 
 
-def consultar_tse_chrome_normal(playwright, pessoa: Pessoa) -> ResultadoTse:
-    global _TSE_BROWSER, _TSE_PROCESS, _TSE_CONTEXT
-    if _TSE_BROWSER is None:
-        _TSE_PROCESS = abrir_tse_no_chrome_normal()
+def pagina_tse(context) -> Page:
+    paginas = [page for page in context.pages if not page.is_closed()]
+    return paginas[-1] if paginas else context.new_page()
+
+
+def sair_do_perfil_tse(page: Page) -> bool:
+    """Fecha o modal do resultado; isso ainda pode manter o eleitor autenticado."""
+    wait_tse_loading(page)
+    nome_sair = re.compile(r"^\s*Sair\s*$", re.I)
+    dialogo = page.get_by_role("dialog")
+    candidatos = (
+        dialogo.get_by_role("button", name=nome_sair).last,
+        page.get_by_role("button", name=nome_sair).last,
+        page.locator("button").filter(has_text=nome_sair).last,
+    )
+
+    for botao in candidatos:
         try:
-            _TSE_BROWSER = playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}"
-            )
-            _TSE_CONTEXT = (
-                _TSE_BROWSER.contexts[0]
-                if _TSE_BROWSER.contexts
-                else _TSE_BROWSER.new_context()
-            )
-            print("Sessao do navegador do TSE aberta; ela sera reutilizada durante toda a rodada.")
-        except BaseException:
-            encerrar_tse(_TSE_BROWSER, _TSE_PROCESS)
-            _TSE_BROWSER = None
-            _TSE_PROCESS = None
-            _TSE_CONTEXT = None
-            raise
-
-    page = _TSE_CONTEXT.pages[-1] if _TSE_CONTEXT.pages else _TSE_CONTEXT.new_page()
-    return consultar_tse_playwright_page(page, pessoa)
-
-
-def encerrar_sessao_tse() -> None:
-    global _TSE_BROWSER, _TSE_PROCESS, _TSE_CONTEXT
-    if _TSE_BROWSER is None and _TSE_PROCESS is None:
-        return
-    encerrar_tse(_TSE_BROWSER, _TSE_PROCESS)
-    _TSE_BROWSER = None
-    _TSE_PROCESS = None
-    _TSE_CONTEXT = None
+            if not botao.is_visible(timeout=1500):
+                continue
+            botao.scroll_into_view_if_needed(timeout=5000)
+            botao.click(timeout=8000)
+            wait_tse_loading(page)
+            fechar_aviso_saida_tse(page)
+            print("Sai do perfil/resultado do eleitor no TSE.")
+            return True
+        except (TimeoutError, Error):
+            continue
+    print("O botao Sair do perfil do eleitor nao estava visivel; seguindo para a pagina inicial.")
+    return False
 
 
 def eleitor_tse_autenticado(page: Page) -> bool:
@@ -817,9 +885,13 @@ def eleitor_tse_autenticado(page: Page) -> bool:
 
 
 def desautenticar_eleitor_tse(page: Page) -> bool:
+    """Clica em 'Nao sou este eleitor' (ou no icone de saida) e confirma a saida."""
+    wait_tse_loading(page)
     if not eleitor_tse_autenticado(page):
         return True
 
+    # Usa a parte sem acento: algumas respostas chegam como "NÃ£o" quando a
+    # pagina nao informa corretamente o charset, mas "sou este eleitor" fica estavel.
     nao_sou = re.compile(r"sou\s+este\s+eleitor", re.I)
     sair = re.compile(r"sair|encerrar|trocar\s+eleitor", re.I)
     candidatos = (
@@ -833,94 +905,53 @@ def desautenticar_eleitor_tse(page: Page) -> bool:
         try:
             if not controle.is_visible(timeout=1500):
                 continue
+            controle.scroll_into_view_if_needed(timeout=5000)
             controle.click(timeout=8000)
+            wait_tse_loading(page)
             page.wait_for_timeout(1000)
             fechar_aviso_saida_tse(page)
             if not eleitor_tse_autenticado(page):
-                print("Sessao do eleitor anterior encerrada; navegador mantido aberto.")
+                print("Sessao do eleitor encerrada no TSE.")
                 return True
         except (TimeoutError, Error):
             continue
+
+    print("ATENCAO: o TSE ainda mostra o eleitor anterior como autenticado.")
     return False
 
 
-def encerrar_tse(browser, chrome_process) -> None:
-    """Fecha o Chrome do TSE de verdade e libera a porta de controle.
-
-    browser.close() sobre uma conexao CDP apenas DESCONECTA -- o processo do
-    Chrome continua vivo. Era por isso que a porta seguia respondendo e a
-    consulta seguinte caia numa janela com a tela da consulta anterior.
-    """
-    if browser is not None:
-        try:
-            browser.close()
-        except (Error, OSError):
-            pass
-
-    if chrome_process is not None:
-        for encerrar in (chrome_process.terminate, chrome_process.kill):
-            try:
-                encerrar()
-                chrome_process.wait(timeout=5)
-                break
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-
-    if cdp_respondendo():
-        matar_chrome_do_tse()
-    esperar_porta_livre()
-
-
-def matar_chrome_do_tse() -> None:
-    """Mata os processos do Chrome abertos com o perfil do TSE.
-
-    O Chrome se ramifica em varios processos e o que o Popen segura nem sempre
-    e o que fica de pe. Filtrar pela linha de comando pega a arvore toda, e nao
-    encosta no Chrome pessoal do operador: o perfil e exclusivo deste bot.
-    """
-    alvo = str(TSE_PROFILE_DIR)
-    nome_processo = "brave.exe" if TSE_NAVEGADOR == "brave" else "chrome.exe"
+def voltar_tse_para_home(context) -> None:
+    if context is None:
+        return
     try:
-        if sys.platform.startswith("win"):
-            script = (
-                f"Get-CimInstance Win32_Process -Filter \"Name='{nome_processo}'\" | "
-                f"Where-Object {{ $_.CommandLine -like '*{alvo}*' }} | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-            )
-            comando = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+        page = pagina_tse(context)
+        sair_do_perfil_tse(page)
+        if ir_para(page, TSE_URL, tentativas=1):
+            wait_tse_loading(page)
+            if desautenticar_eleitor_tse(page):
+                print("TSE voltou para a pagina inicial sem eleitor autenticado; cookies do navegador foram mantidos.")
+            else:
+                print("Nao consegui encerrar o perfil do eleitor. A proxima consulta ficara bloqueada por seguranca.")
         else:
-            comando = ["pkill", "-f", alvo]
-
-        subprocess.run(
-            comando,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
-            **popen_background_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+            print("Nao consegui voltar o TSE para a pagina inicial agora.")
+    except (Error, NavegadorMorto) as exc:
+        print(f"Nao consegui preparar a pagina inicial do TSE: {resumo_erro(exc)}")
 
 
-def esperar_porta_livre(segundos: int = 10) -> bool:
-    limite = time.monotonic() + segundos
-    while time.monotonic() < limite:
-        if not cdp_respondendo():
-            return True
-        time.sleep(0.5)
-    return False
-
-
-def cdp_respondendo() -> bool:
-    import urllib.request
-
+def consultar_tse_chrome_normal(playwright, pessoa: Pessoa, context=None) -> ResultadoTse:
+    contexto_compartilhado = context is not None
+    if context is None:
+        context = abrir_contexto_navegador(playwright, tse=True)
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}/json/version", timeout=1
-        ):
-            return True
-    except OSError:
-        return False
+        page = pagina_tse(context)
+        resultado = consultar_tse_playwright_page(page, pessoa)
+    except BaseException:
+        if not contexto_compartilhado:
+            context.close()
+        raise
+    if not contexto_compartilhado:
+        resultado.fechar_tse = context.close
+    return resultado
 
 
 def abrir_onde_votar(page: Page) -> None:
@@ -944,21 +975,7 @@ def abrir_onde_votar(page: Page) -> None:
         ask_user("Nao achei a tela de autenticacao do TSE. Abra 'Onde Votar' manualmente e pressione Enter...")
         return
 
-    # Sem parar o fluxo: recarrega e tenta abrir "Onde Votar" de novo. Se ainda
-    # assim nao aparecer, quem chamou trata como tentativa perdida.
-    print("Nao achei a tela de autenticacao do TSE. Recarregando...")
-    if not ir_para(page, TSE_URL, tentativas=2):
-        return
-    wait_tse_loading(page)
-    try:
-        page.get_by_text(re.compile(r"onde votar", re.I)).first.click(timeout=8000)
-    except (TimeoutError, Error):
-        pass
-    wait_tse_loading(page)
-    try:
-        campo.wait_for(timeout=15000)
-    except TimeoutError:
-        print("A tela de autenticacao do TSE nao abriu. Sigo para a proxima tentativa.")
+    print("A tela de autenticacao nao abriu. A proxima tentativa respeitara a pausa.")
 
 
 def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
@@ -1001,6 +1018,7 @@ def _preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
         pessoa.mae,
     )
     wait_tse_loading(page)
+    aguardar_pausa(page, TSE_PAUSA_ANTES_ENVIAR_MS)
     try:
         page.get_by_role("button", name=re.compile(r"Entrar", re.I)).click(timeout=20000)
         return True
@@ -1210,12 +1228,8 @@ def clicar_tentar_novamente(page: Page) -> bool:
 
 
 def limpar_erro_captcha(page: Page) -> None:
-    print("Detectei erro/indisponibilidade de CAPTCHA. Limpando tela para tentar de novo...")
-    click_if_visible(page, page.get_by_role("button", name=re.compile(r"Fechar", re.I)).first)
-    click_if_visible(page, page.get_by_role("button", name=re.compile(r"Tentar novamente", re.I)).first)
-    click_if_visible(page, page.locator("button, [role='button']").filter(has_text=re.compile(r"×|x", re.I)).first)
-    page.wait_for_timeout(1200)
-    wait_tse_loading(page, timeout_ms=20000)
+    # Nao clica "Tentar novamente" automaticamente, evitando um segundo envio.
+    print("Erro/indisponibilidade de CAPTCHA. A repeticao respeitara a pausa configurada.")
 
 
 def click_if_visible(page: Page, locator) -> bool:
@@ -1314,57 +1328,33 @@ def consultar_tse_manual(pessoa: Pessoa, motivo: str) -> ResultadoTse:
     )
 
 
-def abrir_tse_no_chrome_normal():
-    # Abre uma vez por rodada. Se uma execucao anterior caiu e deixou a porta
-    # presa, fecha somente os processos ligados ao perfil exclusivo do TSE.
-    if cdp_respondendo():
-        print("Sobrou uma janela do TSE da consulta anterior. Fechando antes de abrir a nova...")
-        matar_chrome_do_tse()
-        if not esperar_porta_livre():
-            print("A janela antiga do TSE nao fechou. Feche-a manualmente se travar.")
-
-    navegador = find_tse_executable()
-    try:
-        process = subprocess.Popen(
-            [
-                navegador,
-                f"--remote-debugging-port={TSE_REMOTE_DEBUGGING_PORT}",
-                f"--user-data-dir={TSE_PROFILE_DIR}",
-                "--no-first-run",
-                "--new-window",
-                TSE_URL,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **popen_background_kwargs(),
-        )
-        wait_cdp_ready()
-        return process
-    except OSError:
-        print(f"Nao consegui abrir o navegador do TSE em {navegador}. Abra manualmente: {TSE_URL}")
-        return None
-
-
-def wait_cdp_ready(timeout_seconds: int = 12) -> None:
-    import urllib.request
-
-    deadline = time.monotonic() + timeout_seconds
-    url = f"http://127.0.0.1:{TSE_REMOTE_DEBUGGING_PORT}/json/version"
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=1):
-                return
-        except OSError:
-            time.sleep(0.4)
-    raise RuntimeError("O navegador do TSE abriu, mas a porta de controle nao respondeu.")
-
-
 def find_tse_executable() -> str:
     if TSE_NAVEGADOR == "chrome":
         return find_chrome_executable()
     if TSE_NAVEGADOR == "brave":
         return find_brave_executable()
-    raise RuntimeError("TSE_NAVEGADOR deve ser 'chrome' ou 'brave'.")
+    if TSE_NAVEGADOR != "edge":
+        raise RuntimeError("TSE_NAVEGADOR deve ser 'brave', 'chrome' ou 'edge'.")
+    candidates = []
+    if sys.platform.startswith("win"):
+        for raiz in (
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if raiz:
+                candidates.append(Path(raiz) / "Microsoft/Edge/Application/msedge.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"))
+    else:
+        for binary in ("microsoft-edge", "microsoft-edge-stable"):
+            found = shutil.which(binary)
+            if found:
+                return found
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError("Microsoft Edge nao encontrado. Use INICIAR-CHROME.cmd ou INICIAR-BRAVE.cmd.")
 
 
 def find_brave_executable() -> str:
@@ -1392,7 +1382,7 @@ def find_brave_executable() -> str:
         if candidate and candidate.is_file():
             return str(candidate)
 
-    raise RuntimeError("Nao encontrei o Brave Browser instalado.")
+    raise RuntimeError("Brave Browser nao encontrado. Instale o Brave ou use INICIAR-CHROME.cmd.")
 
 
 def find_chrome_executable() -> str:
@@ -1425,12 +1415,6 @@ def find_chrome_executable() -> str:
             return str(candidate)
 
     raise RuntimeError("Nao encontrei o Google Chrome. Instale o Chrome ou configure CHROME_EXECUTABLE no inicio do script.")
-
-
-def popen_background_kwargs() -> dict:
-    if sys.platform.startswith("win"):
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
 
 
 def montar_texto_crm(texto: str, status: str, comunicado: str) -> str:
@@ -1711,7 +1695,23 @@ def fill_first_locator(page: Page, selectors: Iterable[str], value: str) -> None
     for selector in selectors:
         locator = page.locator(selector).first
         try:
-            locator.fill(value, timeout=8000)
+            locator.scroll_into_view_if_needed(timeout=8000)
+            locator.click(timeout=8000)
+            aguardar_pausa(page, TSE_PAUSA_APOS_CLIQUE_MS)
+            locator.press("ControlOrMeta+A", timeout=8000)
+            locator.press("Backspace", timeout=8000)
+            locator.press_sequentially(
+                value, delay=TSE_DIGITACAO_MS,
+                timeout=max(15000, len(value) * TSE_DIGITACAO_MS + 10000),
+            )
+            locator.press("Tab", timeout=8000)
+            aguardar_pausa(page, TSE_PAUSA_ENTRE_CAMPOS_MS)
+            atual = locator.input_value(timeout=8000)
+            # Campos com mascara podem inserir/remover separadores de CPF e data.
+            numerico = bool(re.fullmatch(r"[0-9./ -]+", value))
+            confere = only_digits(atual) == only_digits(value) if numerico else normalize_text(atual) == normalize_text(value)
+            if not confere:
+                raise RuntimeError("O campo nao reteve o valor completo; a consulta nao sera enviada.")
             return
         except (TimeoutError, Error):
             continue
@@ -1867,14 +1867,20 @@ def pausar_antes_de_fechar() -> None:
 
 def banner() -> None:
     print("=" * 64)
-    print(" CRM x TSE - consulta de local de votacao")
+    print(" CRM x TSE - VERSAO LENTA")
     print("=" * 64)
     print(f"Os arquivos ficam em: {BASE_DIR}")
     print("  consultas.csv  - registro de tudo que foi consultado")
     print("  bot_error.log  - detalhe do ultimo erro, se houver")
     print()
-    print("Requisitos: Google Chrome instalado e internet.")
-    print("Voce vai precisar resolver o CAPTCHA do TSE a cada consulta.")
+    print("Requisitos: Chrome para CRM, navegador escolhido para TSE e internet.")
+    print("Se aparecer CAPTCHA, resolva manualmente no navegador.")
+    print(f"Pausa entre consultas: {TSE_INTERVALO_ENTRE_CONSULTAS_MS / 1000:.0f} s.")
+    print(f"Perfil CRM: {'temporario' if CRM_PERFIL_LIMPO else 'persistente'}.")
+    print(f"Perfil TSE: {'temporario' if TSE_PERFIL_LIMPO else 'persistente'}.")
+    print(f"TSE: {TSE_NAVEGADOR.upper()} externo; CRM: Chrome iniciado pelo Playwright.")
+    print(f"Digitacao: {TSE_DIGITACAO_MS} ms por caractere, com clique em cada campo.")
+    print("O site ainda pode pedir login ou CAPTCHA; nao ha garantia de dispensa.")
     print("Para interromper a qualquer momento: feche esta janela ou Ctrl+C.")
     print("=" * 64)
     print()
@@ -1886,24 +1892,44 @@ def autoteste() -> int:
     Serve de diagnostico quando o operador diz "nao abre": separa problema de
     Chrome ausente de problema de empacotamento do Playwright.
     """
-    print("1/3 Procurando o Google Chrome...")
+    print("1/3 Procurando os navegadores do CRM e TSE...")
     try:
         chrome = find_chrome_executable()
+        tse_executable = find_tse_executable()
     except RuntimeError as exc:
         print(f"    FALHOU: {exc}")
         return 1
-    print(f"    ok: {chrome}")
+    print(f"    CRM: {chrome}")
+    print(f"    TSE: {tse_executable}")
 
     print("2/3 Iniciando o Playwright...")
     try:
         with sync_playwright() as playwright:
             print("    ok")
-            print("3/3 Abrindo o Chrome...")
+            print("3/3 Testando abertura dos navegadores em pagina vazia...")
             navegador = playwright.chromium.launch(executable_path=chrome, headless=True)
-            pagina = navegador.new_page()
-            pagina.goto("about:blank")
-            print(f"    ok: Chrome {navegador.version}")
-            navegador.close()
+            try:
+                pagina = navegador.new_page()
+                pagina.goto("about:blank")
+                print(f"    ok: Chrome do CRM {navegador.version}")
+            finally:
+                navegador.close()
+            # Usa perfil descartavel e uma porta livre apenas para diagnostico.
+            # Nao le nem altera os perfis de uso real.
+            import socket
+            with socket.socket() as reserva:
+                reserva.bind(("127.0.0.1", 0))
+                porta = reserva.getsockname()[1]
+            tse = abrir_chrome_normal(
+                playwright, executable_path=tse_executable, profile_dir=TSE_PROFILE_DIR,
+                clean=True, slow_mo=0, headless=True, port=porta,
+            )
+            try:
+                pagina = tse.pages[0] if tse.pages else tse.new_page()
+                pagina.goto("about:blank")
+                print(f"    ok: {TSE_NAVEGADOR.upper()} externo do TSE com conexao CDP")
+            finally:
+                tse.close()
     except Exception as exc:
         print(f"    FALHOU: {type(exc).__name__}: {exc}")
         return 1
@@ -1934,5 +1960,4 @@ if __name__ == "__main__":
         if not getattr(sys, "frozen", False):
             raise
     finally:
-        encerrar_sessao_tse()
         pausar_antes_de_fechar()

@@ -1,9 +1,11 @@
 .venv/
+.venv*/
 __pycache__/
 *.py[cod]
 
 .browser-profile/
 .tse-chrome-profile/
+.tse-brave-profile/
 
 bot_error.log
 

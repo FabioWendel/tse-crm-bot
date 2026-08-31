@@ -1,0 +1,4 @@
+playwright==1.62.0
+# 3.5.x publica wheel cp313 que exige um VC runtime ausente nesta maquina
+# (ImportError: DLL load failed while importing _greenlet). 3.1.1 carrega ok.
+greenlet==3.1.1

@@ -1,0 +1,11 @@
+.venv/
+.venv312/
+__pycache__/
+*.py[cod]
+.browser-profile/
+.tse-chrome-profile/
+.tse-edge-profile/
+.tse-brave-profile/
+consultas*.csv
+consultas*.xlsx
+bot_error.log

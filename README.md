@@ -43,6 +43,19 @@ Pré-requisitos: Python 3.11+ e **Google Chrome instalado**. Não é preciso
 `playwright install`: o bot dirige o Chrome do sistema, não o Chromium do
 Playwright.
 
+### Abrir a versão normal com Brave no TSE
+
+Use `INICIAR-BRAVE.cmd`. O CRM continua no Google Chrome e somente a janela do
+TSE abre no Brave instalado. Essa opção usa perfil persistente exclusivo
+`.tse-brave-profile/` e porta local 9226; não reutiliza o perfil pessoal do
+Brave e não ativa stealth, proxy ou resolução automática de CAPTCHA.
+
+Durante uma rodada, a mesma janela do TSE permanece aberta e é reutilizada para
+todas as pessoas. Antes de uma nova consulta, o programa tenta acionar **Não sou
+este eleitor** e confirma que o perfil anterior desapareceu. O processo fecha
+somente quando o programa termina ou é interrompido, evitando deixar a porta de
+controle ocupada para a próxima execução.
+
 ### Linux/macOS
 
 ```bash
