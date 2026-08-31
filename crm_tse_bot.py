@@ -155,6 +155,7 @@ class ResultadoTse:
 _TSE_BROWSER = None
 _TSE_PROCESS = None
 _TSE_CONTEXT = None
+_PERFIL_TSE_BLOQUEADO = False
 
 
 def main() -> None:
@@ -202,11 +203,13 @@ def main() -> None:
         # Repasse: erro costuma ser transitorio (CRM lento, navegacao cortada,
         # TSE fora do ar por um instante). Vale uma segunda passada antes de
         # desistir de vez.
-        if falhas:
+        if falhas and not _PERFIL_TSE_BLOQUEADO:
             print(f"\n{'=' * 60}")
             print(f"{len(falhas)} pessoa(s) falharam. Vou repassar essas agora.")
             print("=" * 60)
             falhas = rodar_fila(playwright, context, crm, falhas, "repasse ")
+        elif falhas and _PERFIL_TSE_BLOQUEADO:
+            print("\nRepasse cancelado: o perfil anterior continua ativo no TSE.")
 
         print(f"\n{'=' * 60}")
         print(f"Fim. Processadas: {len(fila) - len(falhas)}/{len(fila)}.")
@@ -261,12 +264,18 @@ def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa
     Erro numa pessoa nunca derruba as outras: cada uma e isolada, tentada mais
     de uma vez, e o que sobra volta na lista de falhas.
     """
+    global _PERFIL_TSE_BLOQUEADO
     falhas: list[Pessoa] = []
     for index, pendente in enumerate(fila, start=1):
         print(f"\n[{prefixo}{index}/{len(fila)}] Consultando {pendente.nome} - CPF {pendente.cpf}")
         try:
             if not processar_pessoa(playwright, context, crm, pendente):
                 falhas.append(pendente)
+        except PerfilTsePreso:
+            _PERFIL_TSE_BLOQUEADO = True
+            print("\nO TSE manteve o eleitor anterior autenticado. Encerrando a rodada para nao misturar consultas.")
+            falhas.extend(fila[index - 1:])
+            break
         except NavegadorMorto:
             # Sem navegador nao da para continuar; devolve o resto como pendente.
             print("\nO navegador foi fechado. Encerrando.")
@@ -279,12 +288,18 @@ class NavegadorMorto(RuntimeError):
     """Contexto/navegador caiu: nao adianta tentar de novo."""
 
 
+class PerfilTsePreso(RuntimeError):
+    """O TSE nao encerrou o eleitor anterior; continuar seria inseguro."""
+
+
 def processar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
     """Tenta tratar uma pessoa. True = resolvida (ou legitimamente pulada)."""
     for tentativa in range(1, TENTATIVAS_POR_PESSOA + 1):
         try:
             return tratar_pessoa(playwright, context, crm, pendente)
         except KeyboardInterrupt:
+            raise
+        except PerfilTsePreso:
             raise
         except Exception as exc:
             if navegador_caiu(exc):
@@ -706,9 +721,16 @@ def consultar_tse_playwright_page(page: Page, pessoa: Pessoa) -> ResultadoTse:
         if not ir_para(page, TSE_URL, tentativas=2):
             continue
         if eleitor_tse_autenticado(page) and not desautenticar_eleitor_tse(page):
-            print("O perfil do eleitor anterior continuou ativo. Nao vou consultar nem salvar outra pessoa nesta tentativa.")
-            continue
-        abrir_onde_votar(page)
+            print("O perfil do eleitor anterior continuou ativo. Nao vou consultar, salvar nem avancar a fila.")
+            raise PerfilTsePreso("O TSE nao encerrou o perfil do eleitor anterior.")
+        if not abrir_onde_votar(page):
+            if tentativa < MAX_TSE_ATTEMPTS:
+                print("A autenticacao nao ficou disponivel. Vou tentar esta pessoa novamente.")
+                continue
+            return resultado_sem_identificacao(
+                "ERRO NAO IDENTIFICADO",
+                "Tela de autenticacao/CAPTCHA indisponivel apos todas as tentativas.",
+            )
         if not preencher_autenticacao(page, pessoa):
             if tentativa < MAX_TSE_ATTEMPTS:
                 print("Tela do TSE ainda carregando/travada. Vou tentar esta pessoa novamente.")
@@ -820,6 +842,17 @@ def desautenticar_eleitor_tse(page: Page) -> bool:
     if not eleitor_tse_autenticado(page):
         return True
 
+    # Nessa tela o TSE ainda conserva o perfil, mas esconde os controles de
+    # saida. "Tentar novamente" devolve o fluxo para um estado em que o link
+    # "Nao sou este eleitor" pode reaparecer.
+    try:
+        texto = page.locator("body").inner_text(timeout=5000)
+        if has_auth_retry_error(texto):
+            clicar_tentar_novamente(page)
+            page.wait_for_timeout(1000)
+    except (TimeoutError, Error):
+        pass
+
     nao_sou = re.compile(r"sou\s+este\s+eleitor", re.I)
     sair = re.compile(r"sair|encerrar|trocar\s+eleitor", re.I)
     candidatos = (
@@ -827,6 +860,7 @@ def desautenticar_eleitor_tse(page: Page) -> bool:
         page.get_by_text(nao_sou).first,
         page.locator("a, button").filter(has_text=nao_sou).first,
         page.locator("[aria-label*='sair' i], [title*='sair' i], [class*='logout' i], [class*='sign-out' i]").first,
+        page.locator("button:has([class*='sign-out']), a:has([class*='sign-out']), button:has([class*='logout']), a:has([class*='logout'])").first,
         page.get_by_role("button", name=sair).last,
     )
     for controle in candidatos:
@@ -923,7 +957,7 @@ def cdp_respondendo() -> bool:
         return False
 
 
-def abrir_onde_votar(page: Page) -> None:
+def abrir_onde_votar(page: Page) -> bool:
     wait_tse_loading(page)
     try:
         page.get_by_text(re.compile(r"onde votar", re.I)).first.click(timeout=8000)
@@ -931,34 +965,54 @@ def abrir_onde_votar(page: Page) -> None:
         pass
 
     wait_tse_loading(page)
+    if pagina_com_erro_captcha(page):
+        return False
     campo = page.locator("#titulo-cpf-nome").or_(
         page.get_by_role("textbox", name=re.compile(r"título eleitoral|titulo eleitoral|CPF", re.I))
     ).first
     try:
         campo.wait_for(timeout=15000)
-        return
+        return True
     except TimeoutError:
         pass
 
+    if pagina_com_erro_captcha(page):
+        return False
+
     if PERGUNTAR_NO_TERMINAL:
         ask_user("Nao achei a tela de autenticacao do TSE. Abra 'Onde Votar' manualmente e pressione Enter...")
-        return
+        return campo.is_visible(timeout=1500)
 
     # Sem parar o fluxo: recarrega e tenta abrir "Onde Votar" de novo. Se ainda
     # assim nao aparecer, quem chamou trata como tentativa perdida.
     print("Nao achei a tela de autenticacao do TSE. Recarregando...")
     if not ir_para(page, TSE_URL, tentativas=2):
-        return
+        return False
     wait_tse_loading(page)
     try:
         page.get_by_text(re.compile(r"onde votar", re.I)).first.click(timeout=8000)
     except (TimeoutError, Error):
         pass
     wait_tse_loading(page)
+    if pagina_com_erro_captcha(page):
+        return False
     try:
         campo.wait_for(timeout=15000)
+        return True
     except TimeoutError:
         print("A tela de autenticacao do TSE nao abriu. Sigo para a proxima tentativa.")
+        return False
+
+
+def pagina_com_erro_captcha(page: Page) -> bool:
+    try:
+        texto = page.locator("body").inner_text(timeout=5000)
+    except (TimeoutError, Error):
+        return False
+    if not has_captcha_error(texto):
+        return False
+    limpar_erro_captcha(page)
+    return True
 
 
 def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
@@ -967,6 +1021,7 @@ def preencher_autenticacao(page: Page, pessoa: Pessoa) -> bool:
     try:
         return _preencher_autenticacao(page, pessoa)
     except RuntimeError as exc:
+        pagina_com_erro_captcha(page)
         print(f"  autenticacao do TSE falhou: {resumo_erro(exc)}")
         return False
 
