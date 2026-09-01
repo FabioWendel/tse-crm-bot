@@ -47,9 +47,10 @@ TSE_REMOTE_DEBUGGING_PORT = 9226 if TSE_NAVEGADOR == "brave" else 9222
 HEADLESS = False
 SLOW_MO_MS = 120
 LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
-MAX_PAGINAS_INVENTARIO = 200  # trava contra paginacao infinita
+MAX_PAGINAS_INVENTARIO = 1000  # cobre bases grandes sem remover a trava contra loop infinito
 CRM_ITENS_POR_PAGINA = 50  # reduz DOM e memoria do renderer do CRM
 CRM_RECARREGAR_A_CADA_PESSOAS = 50
+CRM_DIVISAO_FIXA_QUATRO = False
 TENTATIVAS_POR_PESSOA = 3  # tentativas reservadas ao inventario inicial do CRM
 TENTATIVAS_PROCESSAMENTO_POR_PESSOA = 1  # falha inesperada segue para o repasse final
 PAUSA_ENTRE_TENTATIVAS_MS = 3000
@@ -562,22 +563,48 @@ def perguntar_operador() -> tuple[int, int, int, int, int]:
     A fatia sai de sha1(cpf) % total, entao os operadores nao precisam se falar:
     a divisao e a mesma em toda maquina e estavel entre execucoes.
     """
-    total = ler_inteiro("Quantos operadores vao rodar agora (1 = so voce)? ", minimo=1, maximo=50)
+    global CRM_DIVISAO_FIXA_QUATRO
 
-    if total == 1:
-        numero = 0
-        print("Rodando sozinho: a fila inteira e sua.")
+    while True:
+        modo_divisao = ask_user(
+            "Como dividir Pendentes? [Enter/1 = configurar operadores, 2 = 4 blocos fixos] "
+        ).strip()
+        if modo_divisao in ("", "1"):
+            CRM_DIVISAO_FIXA_QUATRO = False
+            break
+        if modo_divisao == "2":
+            CRM_DIVISAO_FIXA_QUATRO = True
+            break
+        print("Opcao invalida. Digite 1 ou 2.")
+
+    if CRM_DIVISAO_FIXA_QUATRO:
+        total = 4
+        numero = ler_inteiro("Qual bloco vai rodar agora (0 a 3)? ", minimo=0, maximo=3)
+        print(f"Pendentes: bloco fixo {numero} de 4.")
+        print("Para cobrir 100%, execute os blocos 0, 1, 2 e 3.")
     else:
-        numero = ler_inteiro(f"Voce e o operador numero (0 a {total - 1})? ", minimo=0, maximo=total - 1)
-        print(f"Operador {numero} de {total}.")
-        print("ATENCAO: so as fatias que forem rodadas serao processadas. Para cobrir 100%,")
-        print(f"os numeros 0 a {total - 1} precisam rodar.")
+        total = ler_inteiro("Quantos operadores vao rodar agora (1 = so voce)? ", minimo=1, maximo=50)
 
+        if total == 1:
+            numero = 0
+            print("Rodando sozinho: a fila inteira e sua.")
+        else:
+            numero = ler_inteiro(f"Voce e o operador numero (0 a {total - 1})? ", minimo=0, maximo=total - 1)
+            print(f"Operador {numero} de {total}.")
+            print("ATENCAO: so as fatias que forem rodadas serao processadas. Para cobrir 100%,")
+            print(f"os numeros 0 a {total - 1} precisam rodar.")
+
+    limite_padrao = 0 if CRM_DIVISAO_FIXA_QUATRO else LIMITE_PADRAO
+    mensagem_limite = (
+        "Quantos CPFs no maximo nesta rodada? [Enter/0 = bloco inteiro] "
+        if CRM_DIVISAO_FIXA_QUATRO
+        else f"Quantos CPFs no maximo nesta rodada? [Enter = {LIMITE_PADRAO}, 0 = sem limite] "
+    )
     limite = ler_inteiro(
-        f"Quantos CPFs no maximo nesta rodada? [Enter = {LIMITE_PADRAO}, 0 = sem limite] ",
+        mensagem_limite,
         minimo=0,
         maximo=100000,
-        padrao=LIMITE_PADRAO,
+        padrao=limite_padrao,
     )
     print("Sem teto: vou ate o fim da sua fatia." if limite == 0 else f"Teto desta rodada: {limite} CPF(s).")
     pausar_a_cada = ler_inteiro(

@@ -79,6 +79,17 @@ Se nome da mãe ou nascimento estiver ausente, o programa não abre o TSE e marc
 "Não achei" diretamente no CRM. Uma linha sem CPF fica intocada porque não pode
 ser reencontrada com segurança.
 
+Para dividir **Pendentes** entre quatro máquinas, escolha a opção `2` na primeira
+pergunta. Essa opção mantém a aba Pendentes e divide os CPFs em quatro blocos
+estáveis (`0` a `3`). Rode todos os blocos para cobrir a lista inteira; no teto,
+`Enter` ou `0` não limita o bloco. Na mesma máquina, rode um bloco por vez; o
+paralelismo deve usar máquinas diferentes porque os processos compartilham
+perfil e porta do navegador.
+
+No Windows, abra `INICIAR-BRAVE.cmd`, escolha a divisão `2`, informe um bloco de
+`0` a `3` e pressione `Enter` no teto para percorrer o bloco inteiro. Repita o
+procedimento com os quatro números para cobrir todos os cadastros.
+
 Faça primeiro uma rodada com limite de **1 pessoa**, usando dados cuja consulta
 você está autorizado a realizar. Se surgir CAPTCHA, resolva manualmente na janela.
 Não execute as duas versões sobre a mesma fatia de pessoas ao mesmo tempo.

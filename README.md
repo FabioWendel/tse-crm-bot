@@ -27,6 +27,29 @@ do TSE e gravar o resultado no CRM.
 Situação irregular **com** local de votação é salva automaticamente. Para voltar
 a pedir confirmação no terminal, ponha `CONFIRMAR_IRREGULAR = True`.
 
+## Dividir Pendentes em quatro máquinas
+
+Na primeira pergunta, escolha `2 = 4 blocos fixos`. O programa permanece na aba
+**Pendentes**, divide os CPFs em quatro blocos estáveis e pede qual deles será
+executado: `0`, `1`, `2` ou `3`. Para cobrir todos os pendentes, execute os
+quatro blocos.
+
+Nesse modo, pressione `Enter` (ou informe `0`) para percorrer o bloco inteiro.
+Os quatro blocos podem ser executados sequencialmente na mesma máquina ou
+paralelamente em máquinas diferentes. Não abra várias instâncias na mesma
+máquina, pois elas compartilham os perfis e as portas dos navegadores.
+
+No Windows, abra `INICIAR-BRAVE.cmd` e responda:
+
+```text
+Como dividir Pendentes? 2
+Qual bloco vai rodar agora (0 a 3)? 0
+Quantos CPFs no maximo nesta rodada? Enter
+```
+
+Depois execute novamente escolhendo os blocos `1`, `2` e `3`. Para uma rodada
+curta de conferência, informe um teto pequeno em vez de pressionar `Enter`.
+
 ## Execução paralela
 
 A fatia sai de `sha1(cpf) % total`, então os operadores não precisam se
