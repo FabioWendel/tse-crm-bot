@@ -201,6 +201,11 @@ def main() -> None:
         print(f"\nInventario: {len(todos)} pendente(s) no total.")
         print(f"Operador {numero} de {total_operadores}: {len(fila)} pessoa(s) na sua fatia.")
 
+        if not confirmar_inicio_coordenado(total_operadores, numero, len(todos), len(fila)):
+            print("Execucao cancelada antes das consultas. Nenhum item desta fila foi alterado.")
+            context.close()
+            return
+
         if limite > 0 and len(fila) > limite:
             restantes = len(fila) - limite
             fila = fila[:limite]
@@ -282,6 +287,24 @@ def aguardar_intervalo_entre_consultas(page: Page, segundos: int) -> None:
             time.sleep(1)
     sys.stdout.write("\rPausa concluida. Iniciando a proxima consulta.       \n")
     sys.stdout.flush()
+
+
+def confirmar_inicio_coordenado(total_operadores: int, numero: int, inventario: int, fatia: int) -> bool:
+    """Impede que uma maquina altere Pendentes enquanto as outras inventariam."""
+    if total_operadores <= 1:
+        return True
+
+    print(f"\nBARREIRA DE INICIO - operador/bloco {numero}")
+    print(f"Inventario desta maquina: {inventario}; fatia: {fatia}.")
+    print("Espere TODAS as maquinas chegarem a esta mensagem.")
+    print("Todas precisam mostrar o MESMO total de inventario antes de continuar.")
+    while True:
+        resposta = ask_user("Digite INICIAR quando todas estiverem prontas, ou CANCELAR: ").strip().upper()
+        if resposta == "INICIAR":
+            return True
+        if resposta == "CANCELAR":
+            return False
+        print("Nao comecei. Digite exatamente INICIAR ou CANCELAR.")
 
 
 def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa], prefixo: str) -> list[Pessoa]:

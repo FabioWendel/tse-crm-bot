@@ -90,6 +90,10 @@ No Windows, abra `INICIAR-BRAVE.cmd`, escolha a divisão `2`, informe um bloco d
 `0` a `3` e pressione `Enter` no teto para percorrer o bloco inteiro. Repita o
 procedimento com os quatro números para cobrir todos os cadastros.
 
+Em várias máquinas, todas param na **BARREIRA DE INÍCIO** após o inventário.
+Confira se o total mostrado é idêntico em todas e só então digite `INICIAR` em
+cada terminal. Se algum total for diferente, use `CANCELAR` e reinicie todas.
+
 Faça primeiro uma rodada com limite de **1 pessoa**, usando dados cuja consulta
 você está autorizado a realizar. Se surgir CAPTCHA, resolva manualmente na janela.
 Não execute as duas versões sobre a mesma fatia de pessoas ao mesmo tempo.

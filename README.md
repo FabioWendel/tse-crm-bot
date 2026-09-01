@@ -50,6 +50,12 @@ Quantos CPFs no maximo nesta rodada? Enter
 Depois execute novamente escolhendo os blocos `1`, `2` e `3`. Para uma rodada
 curta de conferência, informe um teto pequeno em vez de pressionar `Enter`.
 
+Antes da primeira consulta, cada máquina para na **BARREIRA DE INÍCIO**. Espere
+todas chegarem ali e confirme que exibem o mesmo total em `Inventario`. Somente
+então digite `INICIAR` em cada uma. Se os totais forem diferentes, digite
+`CANCELAR`, pare todas e reinicie; isso evita que uma máquina remova linhas de
+Pendentes enquanto outra ainda percorre as páginas.
+
 ## Execução paralela
 
 A fatia sai de `sha1(cpf) % total`, então os operadores não precisam se
