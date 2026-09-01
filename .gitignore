@@ -8,6 +8,7 @@ __pycache__/
 .tse-brave-profile/
 
 bot_error.log
+execucao_detalhada.txt
 
 # Dados pessoais de eleitor (CPF, filiacao, endereco). Nunca versionar.
 consultas*.csv

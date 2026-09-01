@@ -17,7 +17,10 @@ do TSE e gravar o resultado no CRM.
 4. Espera você resolver o CAPTCHA. **O robô não tenta burlá-lo.**
 5. Grava o local de votação no CRM, ou marca "Não achei" quando o TSE responde
    que não localizou a pessoa.
-6. Inativa o cadastro quando aplicável: `Título cancelado`, `Não quite`,
+6. Se nome da mãe ou nascimento estiver ausente, não abre o TSE e marca
+   "Não achei" diretamente. Sem CPF, mantém a linha intocada porque não existe
+   uma chave segura para localizar o cadastro.
+7. Inativa o cadastro quando aplicável: `Título cancelado`, `Não quite`,
    `Problema na biometria`, `Dados inválidos` — caindo em "Outro" se o CRM não
    oferecer a opção específica.
 
@@ -50,11 +53,10 @@ TSE abre no Brave instalado. Essa opção usa perfil persistente exclusivo
 `.tse-brave-profile/` e porta local 9226; não reutiliza o perfil pessoal do
 Brave e não ativa stealth, proxy ou resolução automática de CAPTCHA.
 
-Durante uma rodada, a mesma janela do TSE permanece aberta e é reutilizada para
-todas as pessoas. Antes de uma nova consulta, o programa tenta acionar **Não sou
-este eleitor** e confirma que o perfil anterior desapareceu. O processo fecha
-somente quando o programa termina ou é interrompido, evitando deixar a porta de
-controle ocupada para a próxima execução.
+Cada pessoa recebe uma nova instância e uma aba exclusiva do navegador do TSE.
+Ao terminar a consulta, o programa tenta acionar **Não sou este eleitor**, fecha
+a instância e libera a porta de controle. O perfil dedicado continua persistente,
+mas abas restauradas da execução anterior não são reutilizadas.
 
 ### Linux/macOS
 
@@ -65,6 +67,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python crm_tse_bot.py
+```
+
+No macOS, para abrir o TSE no Brave explicitamente (o CRM continua no Google
+Chrome), execute dentro da pasta do projeto:
+
+```bash
+TSE_NAVEGADOR=brave ./.venv/bin/python crm_tse_bot.py
 ```
 
 ### Windows PowerShell
@@ -191,9 +200,18 @@ python csv_para_xlsx.py
 
 Sai um `.xlsx` em modo tabela, com filtro e cabeçalho congelado.
 
+Durante a execução, o terminal mostra apenas um resumo de cada resultado. O
+conteúdo completo continua no `consultas.csv` e também é acrescentado ao arquivo
+legível `execucao_detalhada.txt`, reduzindo o volume acumulado no terminal.
+
+Para execuções longas, o CRM usa até 50 linhas por página e sua página é
+renovada preventivamente a cada 50 pessoas, sempre entre consultas. Se a tela de
+Pendentes não voltar após a renovação, a rodada preserva o restante em vez de
+continuar em um estado incerto.
+
 ## Dados pessoais
 
-`consultas.csv` e `consultas.xlsx` contêm CPF, nome da mãe e endereço de
+`consultas.csv`, `consultas.xlsx` e `execucao_detalhada.txt` contêm CPF, nome da mãe e endereço de
 eleitores. Estão no `.gitignore` e **não devem ser versionados nem
 compartilhados** fora do combinado com o responsável.
 

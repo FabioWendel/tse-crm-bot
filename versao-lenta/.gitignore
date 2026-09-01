@@ -9,3 +9,4 @@ __pycache__/
 consultas*.csv
 consultas*.xlsx
 bot_error.log
+execucao_detalhada.txt

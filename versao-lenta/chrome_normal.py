@@ -121,6 +121,7 @@ class ContextoChromeNormal:
 def abrir_chrome_normal(
     playwright, *, executable_path: str, profile_dir: Path, clean: bool,
     slow_mo: int, headless: bool = False, port: int = 9223,
+    initial_url: str = "about:blank",
 ) -> ContextoChromeNormal:
     if not porta_livre(port):
         raise RuntimeError(
@@ -143,8 +144,7 @@ def abrir_chrome_normal(
         ]
         if headless:
             comando.append("--headless=new")  # somente diagnosticos/testes
-        # O laco da consulta faz a unica navegacao ao TSE quando estiver pronto.
-        comando.append("about:blank")
+        comando.append(initial_url)
         kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform.startswith("win") else {"start_new_session": True}
         processo = subprocess.Popen(
             comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs

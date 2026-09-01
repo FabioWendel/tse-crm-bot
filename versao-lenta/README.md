@@ -26,6 +26,13 @@ participa da fila do CRM e o resultado precisa ser tratado manualmente.
 
 O padrão agora é **Brave no TSE**: use **INICIAR.cmd** ou **INICIAR-BRAVE.cmd**.
 Para escolher outro navegador, use **INICIAR-CHROME.cmd** ou **INICIAR-EDGE.cmd**.
+
+No macOS, usando o ambiente virtual criado na raiz do projeto:
+
+```bash
+cd versao-lenta
+TSE_NAVEGADOR=brave ../.venv/bin/python crm_tse_bot.py
+```
 O CRM permanece no Chrome em todos os casos. Não rode mais de um atalho ao
 mesmo tempo na mesma fila.
 
@@ -68,6 +75,10 @@ com CPF, nascimento e nome da mãe, lê o resultado e grava no CRM. As regras de
 classificação e inativação foram mantidas. **Não é apenas um demonstrador de
 preenchimento: ao rodar normalmente, ele faz alterações reais no CRM.**
 
+Se nome da mãe ou nascimento estiver ausente, o programa não abre o TSE e marca
+"Não achei" diretamente no CRM. Uma linha sem CPF fica intocada porque não pode
+ser reencontrada com segurança.
+
 Faça primeiro uma rodada com limite de **1 pessoa**, usando dados cuja consulta
 você está autorizado a realizar. Se surgir CAPTCHA, resolva manualmente na janela.
 Não execute as duas versões sobre a mesma fatia de pessoas ao mesmo tempo.
@@ -108,8 +119,9 @@ Em encerramento forçado podem sobrar arquivos temporários. Os CSVs e logs são
 mantidos independentemente dessa opção. O programa não apaga o histórico do
 Chrome pessoal e não torna a conexão anônima.
 
-Foram removidas as navegações iniciais redundantes. O TSE abre inicialmente em
-`about:blank` e navega uma vez quando a consulta estiver pronta. A conexão usa
+No fluxo normal, cada janela do TSE abre diretamente no Autoatendimento. O
+`about:blank` permanece apenas como padrão interno para chamadas de diagnóstico.
+A conexão usa
 a porta local **9225** no Brave, **9223** no Chrome ou **9224** no Edge, configurável em `TSE_REMOTE_DEBUGGING_PORT`, diferente da
 9222 usada pelo original. Se estiver ocupada, o bot informa o conflito sem
 conectar em outra janela nem fechá-la. Antes de reiniciar esta versão, feche a
@@ -155,5 +167,12 @@ $env:TESTAR_CHROME = '1'
 Remove-Item Env:TESTAR_CHROME
 ```
 
-`consultas.csv`, planilhas e logs podem conter dados pessoais. Não versione nem
+O terminal mostra um resumo de cada resultado; o conteúdo completo também fica
+em `execucao_detalhada.txt` para evitar excesso de texto na tela.
+
+O CRM usa até 50 linhas por página e é renovado preventivamente a cada 50
+pessoas, somente entre consultas. Se a tela de Pendentes não voltar, o restante
+da fila é preservado.
+
+`consultas.csv`, `execucao_detalhada.txt`, planilhas e logs podem conter dados pessoais. Não versione nem
 compartilhe esses arquivos sem autorização. A pasta nova começa sem esses dados.
