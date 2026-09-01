@@ -70,7 +70,8 @@ py -3.12 -m venv .venv312
 .\.venv312\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-O programa mantém o fluxo do original: inventaria os pendentes, preenche o TSE
+O programa mantém o fluxo do original: carrega a base estática pela API, confirma
+cada CPF em Pendentes, preenche o TSE
 com CPF, nascimento e nome da mãe, lê o resultado e grava no CRM. As regras de
 classificação e inativação foram mantidas. **Não é apenas um demonstrador de
 preenchimento: ao rodar normalmente, ele faz alterações reais no CRM.**
@@ -79,20 +80,12 @@ Se nome da mãe ou nascimento estiver ausente, o programa não abre o TSE e marc
 "Não achei" diretamente no CRM. Uma linha sem CPF fica intocada porque não pode
 ser reencontrada com segurança.
 
-Para dividir **Pendentes** entre quatro máquinas, escolha a opção `2` na primeira
-pergunta. Essa opção mantém a aba Pendentes e divide os CPFs em quatro blocos
-estáveis (`0` a `3`). Rode todos os blocos para cobrir a lista inteira; no teto,
-`Enter` ou `0` não limita o bloco. Na mesma máquina, rode um bloco por vez; o
-paralelismo deve usar máquinas diferentes porque os processos compartilham
-perfil e porta do navegador.
-
-No Windows, abra `INICIAR-BRAVE.cmd`, escolha a divisão `2`, informe um bloco de
-`0` a `3` e pressione `Enter` no teto para percorrer o bloco inteiro. Repita o
-procedimento com os quatro números para cobrir todos os cadastros.
-
-Em várias máquinas, todas param na **BARREIRA DE INÍCIO** após o inventário.
-Confira se o total mostrado é idêntico em todas e só então digite `INICIAR` em
-cada terminal. Se algum total for diferente, use `CANCELAR` e reinicie todas.
+Para dividir **Pendentes** entre máquinas, informe o mesmo total em todas e use
+um número diferente em cada terminal (`0` até `total - 1`). A divisão usa
+`id % total` sobre `/cadastrante/api/eleitores`; por isso não depende da
+paginação de Pendentes. Use teto `0` para percorrer a fatia inteira. Novos IDs
+que entrarem durante a rodada são buscados novamente e enviados apenas à
+máquina responsável por aquela fatia.
 
 Faça primeiro uma rodada com limite de **1 pessoa**, usando dados cuja consulta
 você está autorizado a realizar. Se surgir CAPTCHA, resolva manualmente na janela.

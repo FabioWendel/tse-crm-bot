@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import os
 import re
 import shutil
@@ -18,6 +17,7 @@ from playwright.sync_api import BrowserContext, Error, Page, TimeoutError, sync_
 
 
 CRM_URL = "https://juniorveloso.com.br/cadastrante/validar-local"
+CRM_ELEITORES_API_URL = "https://juniorveloso.com.br/cadastrante/api/eleitores"
 TSE_URL = "https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/"
 
 
@@ -47,10 +47,8 @@ TSE_REMOTE_DEBUGGING_PORT = 9226 if TSE_NAVEGADOR == "brave" else 9222
 HEADLESS = False
 SLOW_MO_MS = 120
 LIMITE_PADRAO = 50  # teto sugerido de CPFs por operador em cada rodada
-MAX_PAGINAS_INVENTARIO = 1000  # cobre bases grandes sem remover a trava contra loop infinito
 CRM_ITENS_POR_PAGINA = 50  # reduz DOM e memoria do renderer do CRM
 CRM_RECARREGAR_A_CADA_PESSOAS = 50
-CRM_DIVISAO_FIXA_QUATRO = False
 TENTATIVAS_POR_PESSOA = 3  # tentativas reservadas ao inventario inicial do CRM
 TENTATIVAS_PROCESSAMENTO_POR_PESSOA = 1  # falha inesperada segue para o repasse final
 PAUSA_ENTRE_TENTATIVAS_MS = 3000
@@ -144,6 +142,7 @@ class Pessoa:
     cpf: str
     mae: str
     nascimento: str
+    crm_id: int | None = None
 
 
 @dataclass
@@ -191,20 +190,17 @@ def main() -> None:
             return
         ensure_crm_ready(crm)
 
-        todos = inventariar_com_retentativa(crm)
+        todos = inventariar_eleitores_api(crm)
         if not todos:
-            print("Nao encontrei linhas na tabela do CRM.")
+            print("A API do CRM nao devolveu eleitores para montar as fatias.")
             context.close()
             return
 
-        fila = [p for p in todos if fatia_do_cpf(p.cpf, total_operadores) == numero]
-        print(f"\nInventario: {len(todos)} pendente(s) no total.")
-        print(f"Operador {numero} de {total_operadores}: {len(fila)} pessoa(s) na sua fatia.")
-
-        if not confirmar_inicio_coordenado(total_operadores, numero, len(todos), len(fila)):
-            print("Execucao cancelada antes das consultas. Nenhum item desta fila foi alterado.")
-            context.close()
-            return
+        fila = [p for p in todos if fatia_da_pessoa(p, total_operadores) == numero]
+        ids_conhecidos = {p.crm_id for p in fila if p.crm_id is not None}
+        print(f"\nBase estatica da API: {len(todos)} eleitor(es) no total.")
+        print(f"Operador {numero} de {total_operadores}: {len(fila)} candidato(s) na sua fatia.")
+        print("Antes do TSE, cada CPF sera confirmado na aba Pendentes; quem ja saiu sera pulado.")
 
         if limite > 0 and len(fila) > limite:
             restantes = len(fila) - limite
@@ -216,7 +212,8 @@ def main() -> None:
             context.close()
             return
 
-        falhas = rodar_fila(playwright, context, crm, fila, "")
+        acompanhar_api = (numero, total_operadores, ids_conhecidos) if limite == 0 else None
+        falhas = rodar_fila(playwright, context, crm, fila, "", acompanhar_api)
 
         # Repasse: erro costuma ser transitorio (CRM lento, navegacao cortada,
         # TSE fora do ar por um instante). Vale uma segunda passada antes de
@@ -289,25 +286,14 @@ def aguardar_intervalo_entre_consultas(page: Page, segundos: int) -> None:
     sys.stdout.flush()
 
 
-def confirmar_inicio_coordenado(total_operadores: int, numero: int, inventario: int, fatia: int) -> bool:
-    """Impede que uma maquina altere Pendentes enquanto as outras inventariam."""
-    if total_operadores <= 1:
-        return True
-
-    print(f"\nBARREIRA DE INICIO - operador/bloco {numero}")
-    print(f"Inventario desta maquina: {inventario}; fatia: {fatia}.")
-    print("Espere TODAS as maquinas chegarem a esta mensagem.")
-    print("Todas precisam mostrar o MESMO total de inventario antes de continuar.")
-    while True:
-        resposta = ask_user("Digite INICIAR quando todas estiverem prontas, ou CANCELAR: ").strip().upper()
-        if resposta == "INICIAR":
-            return True
-        if resposta == "CANCELAR":
-            return False
-        print("Nao comecei. Digite exatamente INICIAR ou CANCELAR.")
-
-
-def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa], prefixo: str) -> list[Pessoa]:
+def rodar_fila(
+    playwright,
+    context: BrowserContext,
+    crm: Page,
+    fila: list[Pessoa],
+    prefixo: str,
+    acompanhar_api: tuple[int, int, set[int]] | None = None,
+) -> list[Pessoa]:
     """Processa a fila e devolve quem NAO deu certo.
 
     Erro numa pessoa nunca derruba as outras: cada uma e isolada, tentada mais
@@ -315,13 +301,18 @@ def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa
     """
     global _PERFIL_TSE_BLOQUEADO, _PESSOAS_DESDE_ULTIMA_PAUSA, _PESSOAS_DESDE_RENOVACAO_CRM
     falhas: list[Pessoa] = []
+    interrompida = False
     for index, pendente in enumerate(fila, start=1):
         if _PESSOAS_DESDE_RENOVACAO_CRM >= CRM_RECARREGAR_A_CADA_PESSOAS:
             if not renovar_crm_controlado(crm):
                 print("O CRM nao voltou apos a renovacao. Encerrando com seguranca e preservando o restante.")
                 falhas.extend(fila[index - 1:])
+                interrompida = True
                 break
             _PESSOAS_DESDE_RENOVACAO_CRM = 0
+            if acompanhar_api is not None:
+                numero, total_operadores, ids_conhecidos = acompanhar_api
+                fila.extend(novos_eleitores_da_api(crm, numero, total_operadores, ids_conhecidos))
 
         if _PESSOAS_DESDE_ULTIMA_PAUSA >= TSE_PAUSAR_A_CADA_PESSOAS:
             segundos = TSE_DURACAO_PAUSA_MS // 1000
@@ -337,14 +328,24 @@ def rodar_fila(playwright, context: BrowserContext, crm: Page, fila: list[Pessoa
             _PERFIL_TSE_BLOQUEADO = True
             print("\nO TSE manteve o eleitor anterior autenticado. Encerrando a rodada para nao misturar consultas.")
             falhas.extend(fila[index - 1:])
+            interrompida = True
             break
         except NavegadorMorto:
             # Sem navegador nao da para continuar; devolve o resto como pendente.
             print("\nO navegador foi fechado. Encerrando.")
             falhas.extend(fila[index - 1:])
+            interrompida = True
             break
         _PESSOAS_DESDE_ULTIMA_PAUSA += 1
         _PESSOAS_DESDE_RENOVACAO_CRM += 1
+
+    if acompanhar_api is not None and not interrompida and not _PERFIL_TSE_BLOQUEADO:
+        numero, total_operadores, ids_conhecidos = acompanhar_api
+        novos = novos_eleitores_da_api(crm, numero, total_operadores, ids_conhecidos)
+        if novos:
+            print(f"Processando {len(novos)} cadastro(s) que entraram durante esta rodada.")
+            fila.extend(novos)
+            falhas.extend(rodar_fila(playwright, context, crm, novos, "novo "))
     return falhas
 
 
@@ -583,44 +584,21 @@ def ir_para(page: Page, url: str, tentativas: int = 3) -> bool:
 def perguntar_operador() -> tuple[int, int, int, int, int]:
     """Pergunta operador, divisao, teto e configuracao das pausas.
 
-    A fatia sai de sha1(cpf) % total, entao os operadores nao precisam se falar:
-    a divisao e a mesma em toda maquina e estavel entre execucoes.
+    A fatia sai de id % total usando a base estatica da API do CRM.
     """
-    global CRM_DIVISAO_FIXA_QUATRO
-
-    while True:
-        modo_divisao = ask_user(
-            "Como dividir Pendentes? [Enter/1 = configurar operadores, 2 = 4 blocos fixos] "
-        ).strip()
-        if modo_divisao in ("", "1"):
-            CRM_DIVISAO_FIXA_QUATRO = False
-            break
-        if modo_divisao == "2":
-            CRM_DIVISAO_FIXA_QUATRO = True
-            break
-        print("Opcao invalida. Digite 1 ou 2.")
-
-    if CRM_DIVISAO_FIXA_QUATRO:
-        total = 4
-        numero = ler_inteiro("Qual bloco vai rodar agora (0 a 3)? ", minimo=0, maximo=3)
-        print(f"Pendentes: bloco fixo {numero} de 4.")
-        print("Para cobrir 100%, execute os blocos 0, 1, 2 e 3.")
+    total = ler_inteiro("Quantas maquinas/operadores vao rodar agora (1 = so voce)? ", minimo=1, maximo=50)
+    if total == 1:
+        numero = 0
+        print("Rodando sozinho: a base inteira e sua.")
     else:
-        total = ler_inteiro("Quantos operadores vao rodar agora (1 = so voce)? ", minimo=1, maximo=50)
+        numero = ler_inteiro(f"Esta maquina e o operador numero (0 a {total - 1})? ", minimo=0, maximo=total - 1)
+        print(f"Operador {numero} de {total}.")
+        print("Para cobrir 100%, todas as maquinas devem usar o mesmo total e numeros diferentes.")
 
-        if total == 1:
-            numero = 0
-            print("Rodando sozinho: a fila inteira e sua.")
-        else:
-            numero = ler_inteiro(f"Voce e o operador numero (0 a {total - 1})? ", minimo=0, maximo=total - 1)
-            print(f"Operador {numero} de {total}.")
-            print("ATENCAO: so as fatias que forem rodadas serao processadas. Para cobrir 100%,")
-            print(f"os numeros 0 a {total - 1} precisam rodar.")
-
-    limite_padrao = 0 if CRM_DIVISAO_FIXA_QUATRO else LIMITE_PADRAO
+    limite_padrao = 0 if total > 1 else LIMITE_PADRAO
     mensagem_limite = (
-        "Quantos CPFs no maximo nesta rodada? [Enter/0 = bloco inteiro] "
-        if CRM_DIVISAO_FIXA_QUATRO
+        "Quantos candidatos no maximo nesta rodada? [Enter/0 = fatia inteira] "
+        if total > 1
         else f"Quantos CPFs no maximo nesta rodada? [Enter = {LIMITE_PADRAO}, 0 = sem limite] "
     )
     limite = ler_inteiro(
@@ -656,66 +634,97 @@ def ler_inteiro(mensagem: str, minimo: int, maximo: int, padrao: int | None = No
         print(f"Valor invalido. Informe um numero inteiro entre {minimo} e {maximo}.")
 
 
-def fatia_do_cpf(cpf: str, total: int) -> int:
-    """Fatia estavel a partir do CPF.
-
-    Usa sha1 em vez de int(cpf) % total: o ultimo digito do CPF e verificador e
-    distribui mal. Medido em 166 CPFs reais, o modulo direto dava 33 pessoas para
-    uma fatia e 10 para outra; o hash ficou entre 13 e 23.
-    """
+def fatia_da_pessoa(pessoa: Pessoa, total: int) -> int:
+    """Distribui pelo ID imutavel do CRM; ordem da tabela nao interfere."""
     if total <= 1:
         return 0
-    return int(hashlib.sha1(cpf.encode("utf-8")).hexdigest(), 16) % total
+    if pessoa.crm_id is None:
+        raise RuntimeError("Eleitor da base API veio sem ID para dividir entre maquinas.")
+    return pessoa.crm_id % total
 
 
-def inventariar_com_retentativa(page: Page) -> list[Pessoa]:
-    """O inventario e a base de tudo: se falhar, nao ha fila. Vale insistir."""
+def inventariar_eleitores_api(page: Page) -> list[Pessoa]:
+    """Carrega uma fotografia completa e estavel pela API autenticada do CRM."""
     for tentativa in range(1, TENTATIVAS_POR_PESSOA + 1):
+        resposta = None
         try:
-            encontrados = inventariar_pendentes(page)
+            resposta = page.request.get(
+                CRM_ELEITORES_API_URL,
+                headers={"Accept": "application/json"},
+                timeout=120000,
+            )
+            if not resposta.ok:
+                raise RuntimeError(f"API /eleitores respondeu HTTP {resposta.status}.")
+            payload = resposta.json()
+            items = payload.get("items") if isinstance(payload, dict) else None
+            total_api = payload.get("total") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                raise RuntimeError("API /eleitores nao devolveu a lista 'items'.")
+            if isinstance(total_api, int) and len(items) != total_api:
+                raise RuntimeError(
+                    f"API /eleitores veio parcial: items={len(items)}, total={total_api}. Nao vou dividir uma base incompleta."
+                )
+
+            encontrados: dict[int, Pessoa] = {}
+            ignorados = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    ignorados += 1
+                    continue
+                try:
+                    crm_id = int(item.get("id"))
+                except (TypeError, ValueError):
+                    ignorados += 1
+                    continue
+                cpf = only_digits(str(item.get("cpf") or ""))
+                if crm_id <= 0 or len(cpf) != 11:
+                    ignorados += 1
+                    continue
+                encontrados[crm_id] = Pessoa(
+                    row_index=-1,
+                    nome=clean_person_name(str(item.get("nome") or "")),
+                    cpf=cpf,
+                    mae="",
+                    nascimento="",
+                    crm_id=crm_id,
+                )
+
+            if ignorados:
+                print(f"API: ignorei {ignorados} item(ns) sem ID/CPF valido.")
             if encontrados:
-                return encontrados
-            print(f"Inventario veio vazio (tentativa {tentativa}/{TENTATIVAS_POR_PESSOA}).")
+                return list(encontrados.values())
+            raise RuntimeError("API /eleitores nao trouxe nenhum eleitor utilizavel.")
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            if navegador_caiu(exc):
-                raise
-            print(f"Inventario falhou ({tentativa}/{TENTATIVAS_POR_PESSOA}): {resumo_erro(exc)}")
-
-        if tentativa < TENTATIVAS_POR_PESSOA:
-            recuperar_crm(page)
+            print(f"Base API falhou ({tentativa}/{TENTATIVAS_POR_PESSOA}): {resumo_erro(exc)}")
+            if tentativa < TENTATIVAS_POR_PESSOA:
+                page.wait_for_timeout(PAUSA_ENTRE_TENTATIVAS_MS)
+        finally:
+            if resposta is not None:
+                resposta.dispose()
     return []
 
 
-def inventariar_pendentes(page: Page) -> list[Pessoa]:
-    """Varre TODAS as paginas de Pendentes e devolve as pessoas legiveis.
-
-    Precisa ser feito de uma vez, antes de qualquer consulta ao TSE: o fluxo
-    antigo so enxergava a pagina 1, e com fatiamento cada operador esgotaria a
-    janela visivel e pararia achando que a fila acabou.
-    """
-    voltar_para_pendentes(page)
-    maximizar_por_pagina(page)
-
-    encontrados: dict[str, Pessoa] = {}
-    for pagina in range(1, MAX_PAGINAS_INVENTARIO + 1):
-        antes = len(encontrados)
-        for row_index in range(total_rows(page)):
-            pessoa = read_person_from_row(page, row_index)
-            if pessoa:
-                encontrados.setdefault(pessoa.cpf, pessoa)
-
-        novos = len(encontrados) - antes
-        print(f"  pagina {pagina}: +{novos} pessoa(s) (total {len(encontrados)})")
-
-        if not ir_para_proxima_pagina(page):
-            break
-        if novos == 0:
-            # Paginou mas nada novo apareceu: trata como fim para nao girar em falso.
-            break
-
-    return list(encontrados.values())
+def novos_eleitores_da_api(
+    page: Page,
+    numero: int,
+    total_operadores: int,
+    ids_conhecidos: set[int],
+) -> list[Pessoa]:
+    """Acrescenta IDs criados durante a rodada sem mudar a maquina responsavel."""
+    base_atual = inventariar_eleitores_api(page)
+    novos: list[Pessoa] = []
+    for pessoa in base_atual:
+        if pessoa.crm_id is None or pessoa.crm_id in ids_conhecidos:
+            continue
+        if fatia_da_pessoa(pessoa, total_operadores) != numero:
+            continue
+        ids_conhecidos.add(pessoa.crm_id)
+        novos.append(pessoa)
+    if novos:
+        print(f"API atualizada: +{len(novos)} novo(s) cadastro(s) desta fatia.")
+    return novos
 
 
 def maximizar_por_pagina(page: Page) -> None:
@@ -743,39 +752,6 @@ def maximizar_por_pagina(page: Page) -> None:
             return
         except (TimeoutError, Error):
             continue
-
-
-def ir_para_proxima_pagina(page: Page) -> bool:
-    """Avanca uma pagina. Devolve False quando nao ha proxima."""
-    candidatos = (
-        page.get_by_role("button", name=re.compile(r"^(pr[óo]xim[ao]|next|seguinte)", re.I)).first,
-        page.get_by_role("link", name=re.compile(r"^(pr[óo]xim[ao]|next|seguinte)", re.I)).first,
-        page.locator("button[aria-label*='rox' i], a[aria-label*='rox' i]").first,
-        page.locator("button, a").filter(has_text=re.compile(r"^\s*(›|»|>)\s*$")).first,
-    )
-
-    primeira_linha = texto_da_primeira_linha(page)
-    for alvo in candidatos:
-        try:
-            if not alvo.is_visible(timeout=1000) or not alvo.is_enabled(timeout=1000):
-                continue
-            alvo.click(timeout=8000)
-        except (TimeoutError, Error):
-            continue
-
-        page.wait_for_timeout(1500)
-        # Confirma que a tabela realmente mudou: botao habilitado na ultima
-        # pagina e comum e faria o laco girar sem sair do lugar.
-        if texto_da_primeira_linha(page) != primeira_linha:
-            return True
-    return False
-
-
-def texto_da_primeira_linha(page: Page) -> str:
-    try:
-        return clean(page.locator("table tbody tr").first.inner_text(timeout=5000))
-    except (TimeoutError, Error):
-        return ""
 
 
 def abrir_pessoa_por_cpf(page: Page, pendente: Pessoa) -> Pessoa | None:

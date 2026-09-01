@@ -10,8 +10,8 @@ do TSE e gravar o resultado no CRM.
 
 1. Pergunta qual operador é este, quantos vão rodar em paralelo e o teto de
    CPFs da rodada.
-2. Inventaria **todas as páginas** de "Pendentes" no CRM e separa a fatia do
-   operador por `sha1(cpf) % total`.
+2. Carrega a base estática em `/cadastrante/api/eleitores` e separa a fatia do
+   operador por `id % total`, sem paginar a tabela de Pendentes.
 3. Para cada pessoa: busca pelo CPF, lê os dados e consulta o TSE num Chrome
    separado.
 4. Espera você resolver o CAPTCHA. **O robô não tenta burlá-lo.**
@@ -27,38 +27,32 @@ do TSE e gravar o resultado no CRM.
 Situação irregular **com** local de votação é salva automaticamente. Para voltar
 a pedir confirmação no terminal, ponha `CONFIRMAR_IRREGULAR = True`.
 
-## Dividir Pendentes em quatro máquinas
+## Dividir Pendentes entre máquinas
 
-Na primeira pergunta, escolha `2 = 4 blocos fixos`. O programa permanece na aba
-**Pendentes**, divide os CPFs em quatro blocos estáveis e pede qual deles será
-executado: `0`, `1`, `2` ou `3`. Para cobrir todos os pendentes, execute os
-quatro blocos.
+Informe a mesma quantidade total em todas as máquinas e escolha um número
+diferente para cada uma, começando em zero. A base da API é estável mesmo quando
+outra máquina remove uma pessoa de Pendentes. Antes de abrir o TSE, o programa
+busca o CPF na aba Pendentes e pula quem já tiver sido tratado.
 
-Nesse modo, pressione `Enter` (ou informe `0`) para percorrer o bloco inteiro.
-Os quatro blocos podem ser executados sequencialmente na mesma máquina ou
-paralelamente em máquinas diferentes. Não abra várias instâncias na mesma
-máquina, pois elas compartilham os perfis e as portas dos navegadores.
+Com teto `0` (ou `Enter` quando houver mais de uma máquina), a fatia é percorrida
+até o fim. A API é consultada novamente a cada renovação preventiva do CRM e ao
+fim da fila; IDs criados durante a execução entram somente na máquina definida
+por `id % total`.
 
 No Windows, abra `INICIAR-BRAVE.cmd` e responda:
 
 ```text
-Como dividir Pendentes? 2
-Qual bloco vai rodar agora (0 a 3)? 0
-Quantos CPFs no maximo nesta rodada? Enter
+Quantas maquinas/operadores vao rodar agora? 3
+Esta maquina e o operador numero (0 a 2)? 0
+Quantos candidatos no maximo nesta rodada? Enter
 ```
 
-Depois execute novamente escolhendo os blocos `1`, `2` e `3`. Para uma rodada
-curta de conferência, informe um teto pequeno em vez de pressionar `Enter`.
-
-Antes da primeira consulta, cada máquina para na **BARREIRA DE INÍCIO**. Espere
-todas chegarem ali e confirme que exibem o mesmo total em `Inventario`. Somente
-então digite `INICIAR` em cada uma. Se os totais forem diferentes, digite
-`CANCELAR`, pare todas e reinicie; isso evita que uma máquina remova linhas de
-Pendentes enquanto outra ainda percorre as páginas.
+Nas outras máquinas use os números `1` e `2`. Para uma rodada curta de
+conferência, informe um teto pequeno em vez de pressionar `Enter`.
 
 ## Execução paralela
 
-A fatia sai de `sha1(cpf) % total`, então os operadores não precisam se
+A fatia sai de `id % total`, então os operadores não precisam se
 coordenar em tempo real — a divisão é idêntica em toda máquina e estável entre
 execuções. Basta todos informarem **o mesmo total** e **números diferentes**.
 
