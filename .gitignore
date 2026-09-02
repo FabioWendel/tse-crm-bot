@@ -20,3 +20,6 @@ consultas*.xlsx
 build/
 dist/
 *.spec
+
+# Perfis e relatorios separados da versao com varios terminais.
+multi-instancia/dados/

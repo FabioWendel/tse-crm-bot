@@ -56,6 +56,17 @@ A fatia sai de `id % total`, então os operadores não precisam se
 coordenar em tempo real — a divisão é idêntica em toda máquina e estável entre
 execuções. Basta todos informarem **o mesmo total** e **números diferentes**.
 
+### Quatro terminais no mesmo computador
+
+Use a pasta `multi-instancia` quando um computador tiver capacidade para quatro
+operadores simultâneos. Abra `multi-instancia/INICIAR-4-TERMINAIS.cmd`; as quatro
+janelas já são fixadas como operadores `0`, `1`, `2` e `3`, com perfis, portas e
+relatórios separados. A versão normal e a lenta continuam inalteradas.
+
+Recomenda-se pelo menos 16 GB de RAM. Na primeira execução será necessário
+entrar no CRM em cada uma das quatro janelas. Consulte o
+`multi-instancia/README.md` para os detalhes.
+
 ⚠️ Só as fatias que rodarem são processadas. Combinar 10 e rodar 3 deixa ~70%
 da fila sem tratamento.
 
