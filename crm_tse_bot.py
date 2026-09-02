@@ -19,6 +19,10 @@ from playwright.sync_api import BrowserContext, Error, Page, TimeoutError, sync_
 CRM_URL = "https://juniorveloso.com.br/cadastrante/validar-local"
 CRM_ELEITORES_API_URL = "https://juniorveloso.com.br/cadastrante/api/eleitores"
 TSE_URL = "https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/"
+FILA_ORIGEM_LABEL = "Base estatica da API"
+FILA_VAZIA_MSG = "A API do CRM nao devolveu eleitores para montar as fatias."
+FILA_FATIA_LABEL = "candidato(s) na sua fatia"
+FILA_CONFIRMACAO_MSG = "Antes do TSE, cada CPF sera confirmado na aba Pendentes; quem ja saiu sera pulado."
 
 
 def pasta_base() -> Path:
@@ -192,15 +196,15 @@ def main() -> None:
 
         todos = inventariar_eleitores_api(crm)
         if not todos:
-            print("A API do CRM nao devolveu eleitores para montar as fatias.")
+            print(FILA_VAZIA_MSG)
             context.close()
             return
 
         fila = [p for p in todos if fatia_da_pessoa(p, total_operadores) == numero]
         ids_conhecidos = {p.crm_id for p in fila if p.crm_id is not None}
-        print(f"\nBase estatica da API: {len(todos)} eleitor(es) no total.")
-        print(f"Operador {numero} de {total_operadores}: {len(fila)} candidato(s) na sua fatia.")
-        print("Antes do TSE, cada CPF sera confirmado na aba Pendentes; quem ja saiu sera pulado.")
+        print(f"\n{FILA_ORIGEM_LABEL}: {len(todos)} eleitor(es) no total.")
+        print(f"Operador {numero} de {total_operadores}: {len(fila)} {FILA_FATIA_LABEL}.")
+        print(FILA_CONFIRMACAO_MSG)
 
         if limite > 0 and len(fila) > limite:
             restantes = len(fila) - limite

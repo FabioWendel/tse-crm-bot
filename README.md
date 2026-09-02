@@ -67,6 +67,13 @@ Recomenda-se pelo menos 16 GB de RAM. Na primeira execução será necessário
 entrar no CRM em cada uma das quatro janelas. Consulte o
 `multi-instancia/README.md` para os detalhes.
 
+### Executar somente a aba Pendentes
+
+Abra `INICIAR-SOMENTE-PENDENTES.cmd` para montar uma fila diretamente das páginas
+de **Pendentes**, sem carregar toda a base da API. Esse modo deve rodar sozinho,
+sem outras máquinas retirando linhas durante o inventário inicial. Consulte
+`somente-pendentes/README.md`.
+
 ⚠️ Só as fatias que rodarem são processadas. Combinar 10 e rodar 3 deixa ~70%
 da fila sem tratamento.
 
