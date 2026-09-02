@@ -39,6 +39,7 @@ def pasta_base() -> Path:
 
 BASE_DIR = pasta_base()
 TSE_NAVEGADOR = os.environ.get("TSE_NAVEGADOR", "chrome").strip().lower()
+TSE_BRAVE_EXECUTABLE = os.environ.get("TSE_BRAVE_EXECUTABLE", "").strip()
 PROFILE_DIR = BASE_DIR / ".browser-profile"
 TSE_PROFILE_DIR = BASE_DIR / (".tse-brave-profile" if TSE_NAVEGADOR == "brave" else ".tse-chrome-profile")
 LOG_FILE = BASE_DIR / "consultas.csv"
@@ -1783,6 +1784,12 @@ def find_tse_executable() -> str:
 
 
 def find_brave_executable() -> str:
+    if TSE_BRAVE_EXECUTABLE:
+        configurado = Path(TSE_BRAVE_EXECUTABLE).expanduser()
+        if configurado.is_file():
+            return str(configurado)
+        raise RuntimeError(f"Brave configurado nao foi encontrado em: {configurado}")
+
     candidates = []
     if sys.platform.startswith("win"):
         program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")

@@ -15,3 +15,11 @@ em Pendentes depois da fotografia inicial ficam para a próxima execução.
 Este modo compartilha os perfis e relatórios da versão normal. Portanto, não abra
 `INICIAR-BRAVE.cmd` e `INICIAR-SOMENTE-PENDENTES.cmd` simultaneamente no mesmo
 computador.
+
+No macOS, uma instalação específica do Brave pode ser selecionada assim:
+
+```bash
+TSE_NAVEGADOR=brave \
+TSE_BRAVE_EXECUTABLE="/Applications/Brave Browser 1.92.app/Contents/MacOS/Brave Browser" \
+./.venv/bin/python somente-pendentes/crm_tse_bot_pendentes.py
+```

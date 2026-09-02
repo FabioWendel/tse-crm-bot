@@ -33,6 +33,14 @@ No macOS, usando o ambiente virtual criado na raiz do projeto:
 cd versao-lenta
 TSE_NAVEGADOR=brave ../.venv/bin/python crm_tse_bot.py
 ```
+
+Para apontar para uma versão específica no macOS:
+
+```bash
+TSE_NAVEGADOR=brave \
+TSE_BRAVE_EXECUTABLE="/Applications/Brave Browser 1.92.app/Contents/MacOS/Brave Browser" \
+../.venv/bin/python crm_tse_bot.py
+```
 O CRM permanece no Chrome em todos os casos. Não rode mais de um atalho ao
 mesmo tempo na mesma fila.
 

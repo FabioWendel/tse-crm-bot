@@ -117,6 +117,15 @@ Chrome), execute dentro da pasta do projeto:
 TSE_NAVEGADOR=brave ./.venv/bin/python crm_tse_bot.py
 ```
 
+Para escolher uma instalação específica do Brave, informe o executável. Isso é
+útil em Macs antigos que precisam manter a última versão compatível:
+
+```bash
+TSE_NAVEGADOR=brave \
+TSE_BRAVE_EXECUTABLE="/Applications/Brave Browser 1.92.app/Contents/MacOS/Brave Browser" \
+./.venv/bin/python crm_tse_bot.py
+```
+
 ### Windows PowerShell
 
 ```powershell
