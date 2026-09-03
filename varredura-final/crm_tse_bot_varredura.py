@@ -431,6 +431,7 @@ def montar_fila(
     pendentes: list[bot.Pessoa],
     concluidos: set[str],
     tecnicos: set[str],
+    base_total_disponivel: bool = True,
 ) -> tuple[
     list[bot.Pessoa],
     list[dict[str, str]],
@@ -441,16 +442,20 @@ def montar_fila(
     auditoria: list[dict[str, str]] = []
     contagem: Counter = Counter()
 
-    base_por_cpf = {
-        pessoa.cpf: pessoa
-        for pessoa in base_total
-        if cpf_valido(pessoa.cpf)
-    }
     pendentes_por_cpf = {
         pessoa.cpf: pessoa
         for pessoa in pendentes
         if cpf_valido(pessoa.cpf)
     }
+    base_por_cpf = (
+        {
+            pessoa.cpf: pessoa
+            for pessoa in base_total
+            if cpf_valido(pessoa.cpf)
+        }
+        if base_total_disponivel
+        else dict(pendentes_por_cpf)
+    )
 
     for item_invalido in ULTIMOS_ITENS_INVALIDOS:
         cpf = item_invalido["cpf"]
@@ -521,27 +526,28 @@ def montar_fila(
             "observacao": "",
         })
 
-    for cpf, pessoa in pendentes_por_cpf.items():
-        if cpf in base_por_cpf:
-            continue
-        auditoria.append({
-            "id": str(pessoa.crm_id or ""),
-            "cpf": cpf,
-            "nome": pessoa.nome,
-            "aba_atual": "Pendentes",
-            "historico_4_operadores": classificar_historico(
-                cpf,
-                concluidos,
-                tecnicos,
-            ),
-            "dados_validos": "NÃO APLICÁVEL",
-            "acao": "FORA_DA_BASE_TOTAL",
-            "observacao": (
-                "CPF apareceu em Pendentes, mas não existe na fotografia "
-                "da base total; não foi incluído na fila."
-            ),
-        })
-        contagem["pendente_fora_base"] += 1
+    if base_total_disponivel:
+        for cpf, pessoa in pendentes_por_cpf.items():
+            if cpf in base_por_cpf:
+                continue
+            auditoria.append({
+                "id": str(pessoa.crm_id or ""),
+                "cpf": cpf,
+                "nome": pessoa.nome,
+                "aba_atual": "Pendentes",
+                "historico_4_operadores": classificar_historico(
+                    cpf,
+                    concluidos,
+                    tecnicos,
+                ),
+                "dados_validos": "NÃO APLICÁVEL",
+                "acao": "FORA_DA_BASE_TOTAL",
+                "observacao": (
+                    "CPF apareceu em Pendentes, mas não existe na fotografia "
+                    "da base total; não foi incluído na fila."
+                ),
+            })
+            contagem["pendente_fora_base"] += 1
 
     return fila, auditoria, contagem
 
@@ -665,9 +671,12 @@ def executar() -> int:
                 "Fotografando a base total pela API autenticada do CRM..."
             )
             base_total = bot.inventariar_eleitores_api(crm)
-            if not base_total:
-                raise RuntimeError(
-                    "A API /cadastrante/api/eleitores não devolveu uma base utilizável."
+            base_total_disponivel = bool(base_total)
+            if not base_total_disponivel:
+                print(
+                    "AVISO: a API /cadastrante/api/eleitores permaneceu "
+                    "indisponível após as tentativas. A varredura continuará "
+                    "usando a fotografia de Pendentes."
                 )
 
             print()
@@ -690,6 +699,7 @@ def executar() -> int:
                     pendentes,
                     concluidos,
                     tecnicos,
+                    base_total_disponivel=base_total_disponivel,
                 )
             )
 
@@ -742,16 +752,22 @@ def executar() -> int:
             print(" RESULTADO DA VARREDURA")
             print("=" * 72)
 
-            cpfs_base = {
-                pessoa.cpf
-                for pessoa in base_total
-                if cpf_valido(pessoa.cpf)
-            }
-
-            print(
-                f"Total da base:                       "
-                f"{len(base_total)}"
-            )
+            if base_total_disponivel:
+                cpfs_base = {
+                    pessoa.cpf
+                    for pessoa in base_total
+                    if cpf_valido(pessoa.cpf)
+                }
+                print(
+                    f"Total da base:                       "
+                    f"{len(base_total)}"
+                )
+            else:
+                cpfs_base = set()
+                print(
+                    "Total da base:                       "
+                    "INDISPONIVEL (API /eleitores HTTP 500)"
+                )
 
             print(
                 f"CPFs realizados nos 4 operadores:   "
@@ -763,10 +779,16 @@ def executar() -> int:
                 f"{hist['cpfs_erro_log']}"
             )
 
-            print(
-                f"Residual inicial pelo histórico:    "
-                f"{len(cpfs_base - realizados_csv)}"
-            )
+            if base_total_disponivel:
+                print(
+                    f"Residual inicial pelo histórico:    "
+                    f"{len(cpfs_base - realizados_csv)}"
+                )
+            else:
+                print(
+                    "Residual inicial pelo histórico:    "
+                    "NAO VERIFICADO"
+                )
 
             print(
                 f"Pendentes atuais:                    "
@@ -800,10 +822,16 @@ def executar() -> int:
                 f"{contagem['dados_insuficientes']}"
             )
 
-            print(
-                f"Pendentes fora da base total:        "
-                f"{contagem['pendente_fora_base']}"
-            )
+            if base_total_disponivel:
+                print(
+                    f"Pendentes fora da base total:        "
+                    f"{contagem['pendente_fora_base']}"
+                )
+            else:
+                print(
+                    "Pendentes fora da base total:        "
+                    "NAO VERIFICADO"
+                )
 
             print()
             print(
