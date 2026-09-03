@@ -9,12 +9,17 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
+from playwright.sync_api import Page, sync_playwright
 
 
 TOTAL_OPERADORES = 4
+PENDENTES_API_URL = "https://juniorveloso.com.br/cadastrante/api/validar-local"
+PENDENTES_POR_PAGINA = 100
+MAX_PAGINAS_API = 1000
 
-ABA_PENDENTES = "Pendentes"
+ULTIMO_TOTAL_PENDENTES_API = 0
+ULTIMOS_ITENS_INVALIDOS: list[dict[str, str]] = []
+ULTIMOS_DUPLICADOS_API = 0
 
 VALORES_SEM_DADO = {
     "",
@@ -97,18 +102,20 @@ def cpf_valido(valor: object) -> bool:
 
 
 def nascimento_valido(valor: object) -> bool:
-    texto = normalizar(valor)
+    return bool(normalizar_nascimento(valor))
 
-    if texto in VALORES_SEM_DADO:
-        return False
 
-    formatos = (
-        r"\d{2}/\d{2}/\d{4}",
-        r"\d{2}-\d{2}-\d{4}",
-        r"\d{4}-\d{2}-\d{2}",
-    )
+def normalizar_nascimento(valor: object) -> str:
+    texto = str(valor or "").strip()
+    if normalizar(texto) in VALORES_SEM_DADO:
+        return ""
 
-    return any(re.fullmatch(formato, texto) for formato in formatos)
+    for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(texto, formato).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return ""
 
 
 def dados_minimos_validos(pessoa: bot.Pessoa) -> tuple[bool, str]:
@@ -209,227 +216,120 @@ def ler_historico() -> tuple[set[str], set[str], Counter]:
 
 
 # ------------------------------------------------------------
-# NAVEGAÇÃO DAS ABAS
+# FOTOGRAFIA DE PENDENTES PELA API AUTENTICADA
 # ------------------------------------------------------------
 
 
-def clicar_aba(page: Page, nome: str) -> bool:
-    candidatos = (
-        page.get_by_role(
-            "button",
-            name=re.compile(re.escape(nome), re.I),
-        ).first,
-        page.get_by_role(
-            "tab",
-            name=re.compile(re.escape(nome), re.I),
-        ).first,
-        page.get_by_text(
-            re.compile(
-                rf"^\s*{re.escape(nome)}(?:\s+\d+)?\s*$",
-                re.I,
+def inventariar_pendentes_api(page: Page) -> list[bot.Pessoa]:
+    global ULTIMO_TOTAL_PENDENTES_API, ULTIMOS_ITENS_INVALIDOS, ULTIMOS_DUPLICADOS_API
+
+    ULTIMO_TOTAL_PENDENTES_API = 0
+    ULTIMOS_ITENS_INVALIDOS = []
+    ULTIMOS_DUPLICADOS_API = 0
+
+    por_id: dict[int, bot.Pessoa] = {}
+    cpfs_vistos: set[str] = set()
+    ids_pagina_anterior: tuple[str, ...] | None = None
+
+    for numero_pagina in range(1, MAX_PAGINAS_API + 1):
+        resposta = None
+        try:
+            resposta = page.request.get(
+                PENDENTES_API_URL,
+                params={
+                    "aba": "pendentes",
+                    "q": "",
+                    "page": numero_pagina,
+                    "per_page": PENDENTES_POR_PAGINA,
+                    "sort": "nome",
+                    "dir": "asc",
+                },
+                headers={"Accept": "application/json"},
+                timeout=120000,
             )
-        ).first,
-    )
+            if not resposta.ok:
+                raise RuntimeError(
+                    f"API de Pendentes respondeu HTTP {resposta.status} na página {numero_pagina}."
+                )
 
-    for candidato in candidatos:
-        try:
-            if not candidato.is_visible(timeout=1500):
-                continue
+            payload = resposta.json()
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
+                items = payload["items"]
+            else:
+                raise RuntimeError(
+                    f"API de Pendentes devolveu JSON inesperado na página {numero_pagina}."
+                )
 
-            candidato.click(timeout=8000)
-            page.wait_for_timeout(1200)
+            ULTIMO_TOTAL_PENDENTES_API += len(items)
+            ids_pagina = tuple(
+                str(item.get("id") if isinstance(item, dict) else "<item-inválido>")
+                for item in items
+            )
+            if items and ids_pagina == ids_pagina_anterior:
+                raise RuntimeError(
+                    f"API de Pendentes repetiu exatamente os IDs da página {numero_pagina - 1}; "
+                    "a fotografia foi abortada para não gerar uma fila incompleta."
+                )
+            ids_pagina_anterior = ids_pagina
 
-            return True
+            antes = len(por_id)
+            for indice, item in enumerate(items, start=1):
+                if not isinstance(item, dict):
+                    ULTIMOS_ITENS_INVALIDOS.append({
+                        "cpf": "",
+                        "observacao": f"Página {numero_pagina}, item {indice}: não é um objeto JSON.",
+                    })
+                    continue
 
-        except (TimeoutError, Error):
-            continue
+                try:
+                    crm_id = int(item.get("id"))
+                except (TypeError, ValueError):
+                    crm_id = 0
+                cpf = bot.only_digits(str(item.get("cpf") or ""))
 
-    return False
+                problemas: list[str] = []
+                if crm_id <= 0:
+                    problemas.append("ID ausente ou inválido")
+                if len(cpf) != 11:
+                    problemas.append("CPF ausente ou inválido")
+                if problemas:
+                    ULTIMOS_ITENS_INVALIDOS.append({
+                        "cpf": cpf,
+                        "observacao": f"Página {numero_pagina}, item {indice}: {', '.join(problemas)}.",
+                    })
+                    continue
 
+                if crm_id in por_id or cpf in cpfs_vistos:
+                    ULTIMOS_DUPLICADOS_API += 1
+                    continue
 
-def primeira_linha(page: Page) -> str:
-    try:
-        return bot.clean(
-            page.locator("table tbody tr")
-            .first
-            .inner_text(timeout=4000)
-        )
-    except (TimeoutError, Error):
-        return ""
+                pessoa = bot.Pessoa(
+                    row_index=-1,
+                    nome=str(item.get("nome") or "").strip(),
+                    cpf=cpf,
+                    mae=str(item.get("nome_da_mae") or "").strip(),
+                    nascimento=normalizar_nascimento(item.get("nascimento")),
+                    crm_id=crm_id,
+                )
+                por_id[crm_id] = pessoa
+                cpfs_vistos.add(cpf)
 
+            novos = len(por_id) - antes
+            print(f"API Pendentes: página {numero_pagina}, +{novos}, total {len(por_id)}")
 
-def voltar_primeira_pagina(page: Page) -> None:
-    candidatos = (
-        page.get_by_role(
-            "button",
-            name=re.compile(r"primeir", re.I),
-        ).first,
-        page.get_by_role(
-            "link",
-            name=re.compile(r"primeir", re.I),
-        ).first,
-        page.locator("button, a").filter(
-            has_text=re.compile(r"^\s*(«|<<)\s*$")
-        ).first,
-    )
+            if len(items) < PENDENTES_POR_PAGINA:
+                return list(por_id.values())
+            if numero_pagina == MAX_PAGINAS_API:
+                raise RuntimeError(
+                    f"API de Pendentes atingiu o limite de segurança de {MAX_PAGINAS_API} páginas."
+                )
+        finally:
+            if resposta is not None:
+                resposta.dispose()
 
-    for candidato in candidatos:
-        try:
-            if (
-                candidato.is_visible(timeout=700)
-                and candidato.is_enabled(timeout=700)
-            ):
-                candidato.click(timeout=5000)
-                page.wait_for_timeout(1000)
-                return
-
-        except (TimeoutError, Error):
-            continue
-
-
-def proxima_pagina(page: Page) -> bool:
-    anterior = primeira_linha(page)
-
-    candidatos = (
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^(pr[óo]xim[ao]|next|seguinte)",
-                re.I,
-            ),
-        ).first,
-        page.get_by_role(
-            "link",
-            name=re.compile(
-                r"^(pr[óo]xim[ao]|next|seguinte)",
-                re.I,
-            ),
-        ).first,
-        page.locator(
-            "button[aria-label*='rox' i], "
-            "a[aria-label*='rox' i]"
-        ).first,
-        page.locator("button, a").filter(
-            has_text=re.compile(r"^\s*(›|»|>)\s*$")
-        ).first,
-    )
-
-    for candidato in candidatos:
-        try:
-            if not candidato.is_visible(timeout=700):
-                continue
-
-            if not candidato.is_enabled(timeout=700):
-                continue
-
-            candidato.click(timeout=6000)
-            page.wait_for_timeout(1200)
-
-            atual = primeira_linha(page)
-
-            return atual != anterior
-
-        except (TimeoutError, Error):
-            continue
-
-    return False
-
-
-def extrair_cpf_da_linha(texto: str) -> str:
-    candidatos = re.findall(
-        r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
-        r"|\b\d{11}\b",
-        texto,
-    )
-
-    for candidato in candidatos:
-        cpf = bot.only_digits(candidato)
-
-        if len(cpf) == 11:
-            return cpf
-
-    return ""
-
-
-def inventariar_aba(page: Page, aba: str) -> set[str]:
-    print()
-    print(f">>> Varrendo aba: {aba}")
-
-    if not clicar_aba(page, aba):
-        raise RuntimeError(
-            f"Não consegui abrir a aba {aba!r}."
-        )
-
-    voltar_primeira_pagina(page)
-    bot.maximizar_por_pagina(page)
-
-    cpfs: set[str] = set()
-
-    for pagina in range(1, 1001):
-        rows = page.locator("table tbody tr")
-        quantidade = rows.count()
-
-        antes = len(cpfs)
-
-        for indice in range(quantidade):
-            row = rows.nth(indice)
-
-            try:
-                texto = row.inner_text(timeout=5000)
-            except (TimeoutError, Error):
-                continue
-
-            cpf = extrair_cpf_da_linha(texto)
-
-            if cpf:
-                cpfs.add(cpf)
-
-        novos = len(cpfs) - antes
-
-        print(
-            f"  página {pagina}: "
-            f"+{novos} CPF(s), total {len(cpfs)}"
-        )
-
-        if not proxima_pagina(page):
-            break
-
-    return cpfs
-
-# ------------------------------------------------------------
-# VALIDAÇÃO AO VIVO DOS PENDENTES
-# ------------------------------------------------------------
-
-
-def carregar_pendente_atual(
-    page: Page,
-    referencia: bot.Pessoa,
-) -> tuple[bot.Pessoa | None, str]:
-
-    """
-    Usa o próprio mecanismo do bot para buscar pelo CPF.
-
-    Isso é importante porque outra máquina pode alterar o CRM
-    entre a fotografia inicial e o momento de processamento.
-    """
-
-    try:
-        pessoa = bot.abrir_pessoa_por_cpf(
-            page,
-            referencia,
-        )
-    except Exception as exc:
-        return None, f"erro ao reler CPF: {exc}"
-
-    if pessoa is None:
-        return None, "não está mais em Pendentes"
-
-    valido, motivo = dados_minimos_validos(pessoa)
-
-    if not valido:
-        return None, f"dados insuficientes: {motivo}"
-
-    return pessoa, ""
+    return list(por_id.values())
 
 
 # ------------------------------------------------------------
@@ -468,9 +368,7 @@ def salvar_csv(
 # ------------------------------------------------------------
 
 def montar_fila(
-    page: Page,
-    base_api: list[bot.Pessoa],
-    cpfs_pendentes: set[str],
+    pendentes: list[bot.Pessoa],
     concluidos: set[str],
     tecnicos: set[str],
 ) -> tuple[
@@ -483,84 +381,29 @@ def montar_fila(
     auditoria: list[dict[str, str]] = []
     contagem: Counter = Counter()
 
-    # Mapa rápido da fotografia inicial da API.
-    base_por_cpf = {
-        pessoa.cpf: pessoa
-        for pessoa in base_api
-        if pessoa.cpf
-    }
+    for item_invalido in ULTIMOS_ITENS_INVALIDOS:
+        cpf = item_invalido["cpf"]
+        auditoria.append({
+            "cpf": cpf,
+            "historico": classificar_historico(cpf, concluidos, tecnicos),
+            "acao": "ITEM_API_INVALIDO",
+            "observacao": item_invalido["observacao"],
+        })
 
-    print()
-    print(
-        f"CPFs presentes em Pendentes agora: "
-        f"{len(cpfs_pendentes)}"
-    )
+    for pessoa in pendentes:
+        cpf = pessoa.cpf
+        historico = classificar_historico(cpf, concluidos, tecnicos)
+        contagem[f"historico_{historico}"] += 1
+        valido, problema = dados_minimos_validos(pessoa)
 
-    for indice, cpf in enumerate(
-        sorted(cpfs_pendentes),
-        start=1,
-    ):
-        referencia = base_por_cpf.get(cpf)
-
-        if cpf in concluidos:
-            historico = "CONCLUIDO"
-        elif cpf in tecnicos:
-            historico = "FALHA_TECNICA"
-        else:
-            historico = "NOVO"
-
-        if referencia is None:
-            contagem["sem_api"] += 1
-
+        if not valido:
+            contagem["dados_insuficientes"] += 1
             auditoria.append({
                 "cpf": cpf,
                 "historico": historico,
-                "aba_atual": "Pendentes",
-                "acao": "SEM_REGISTRO_API",
-                "observacao": (
-                    "CPF apareceu em Pendentes, mas não estava "
-                    "na fotografia inicial da API."
-                ),
+                "acao": "DADOS_INSUFICIENTES",
+                "observacao": f"Campos ausentes ou inválidos: {problema}.",
             })
-
-            continue
-
-        print(
-            f"\nValidando [{indice}/{len(cpfs_pendentes)}] "
-            f"CPF {cpf}"
-        )
-
-        pessoa, problema = carregar_pendente_atual(
-            page,
-            referencia,
-        )
-
-        if pessoa is None:
-            if problema == "não está mais em Pendentes":
-                contagem["movido_durante_varredura"] += 1
-
-                auditoria.append({
-                    "cpf": cpf,
-                    "historico": historico,
-                    "aba_atual": "Pendentes",
-                    "acao": "MOVIDO_DURANTE_VARREDURA",
-                    "observacao": (
-                        "Outra máquina ou processo retirou "
-                        "o CPF de Pendentes durante a auditoria."
-                    ),
-                })
-
-            else:
-                contagem["dados_insuficientes"] += 1
-
-                auditoria.append({
-                    "cpf": cpf,
-                    "historico": historico,
-                    "aba_atual": "Pendentes",
-                    "acao": "DADOS_INSUFICIENTES",
-                    "observacao": problema,
-                })
-
             continue
 
         fila.append(pessoa)
@@ -568,9 +411,7 @@ def montar_fila(
         if historico == "FALHA_TECNICA":
             contagem["fila_FALHA_TECNICA"] += 1
 
-        elif historico == "CONCLUIDO":
-            # O histórico dizia concluído, mas o CRM atual ainda
-            # mantém a pessoa em Pendentes. O estado atual vence.
+        elif historico == "CONCLUIDO_MAS_AINDA_PENDENTE":
             contagem["fila_CONCLUIDO_PENDENTE"] += 1
 
         else:
@@ -581,12 +422,31 @@ def montar_fila(
         auditoria.append({
             "cpf": cpf,
             "historico": historico,
-            "aba_atual": "Pendentes",
             "acao": "PROCESSAR",
             "observacao": "",
         })
 
     return fila, auditoria, contagem
+
+
+def classificar_historico(
+    cpf: str,
+    concluidos: set[str],
+    tecnicos: set[str],
+) -> str:
+    if cpf in concluidos:
+        return "CONCLUIDO_MAS_AINDA_PENDENTE"
+    if cpf in tecnicos:
+        return "FALHA_TECNICA"
+    return "NOVO"
+
+
+def origem_historico(historico: str) -> str:
+    return {
+        "NOVO": "novo",
+        "FALHA_TECNICA": "falha_tecnica",
+        "CONCLUIDO_MAS_AINDA_PENDENTE": "concluido_ainda_pendente",
+    }[historico]
 
 # ------------------------------------------------------------
 # EXECUÇÃO
@@ -677,45 +537,21 @@ def executar() -> int:
 
             print()
             print(
-                "Obtendo fotografia completa "
-                "da API do CRM..."
+                "Fotografando todos os Pendentes "
+                "pela API autenticada do CRM..."
             )
 
-            base_api = (
-                bot.inventariar_eleitores_api(crm)
-            )
-
-            if not base_api:
-                raise RuntimeError(
-                    "A API não devolveu a base completa."
-                )
-
-            print(
-                f"Total atual da API: "
-                f"{len(base_api)}"
-            )
+            pendentes = inventariar_pendentes_api(crm)
 
             print()
             print(
-                "Fotografando somente a aba Pendentes..."
-            )
-
-            cpfs_pendentes = inventariar_aba(
-                crm,
-                ABA_PENDENTES,
-            )
-
-            print()
-            print(
-                f"Pendentes encontrados: "
-                f"{len(cpfs_pendentes)}"
+                f"Pendentes retornados pela API: "
+                f"{ULTIMO_TOTAL_PENDENTES_API}"
             )
 
             fila, auditoria, contagem = (
                 montar_fila(
-                    crm,
-                    base_api,
-                    cpfs_pendentes,
+                    pendentes,
                     concluidos,
                     tecnicos,
                 )
@@ -727,7 +563,6 @@ def executar() -> int:
                 [
                     "cpf",
                     "historico",
-                    "aba_atual",
                     "acao",
                     "observacao",
                 ],
@@ -741,10 +576,12 @@ def executar() -> int:
                         "nome": p.nome,
                         "mae": p.mae,
                         "nascimento": p.nascimento,
-                        "origem": (
-                            "falha_tecnica"
-                            if p.cpf in tecnicos
-                            else "novo"
+                        "origem": origem_historico(
+                            classificar_historico(
+                                p.cpf,
+                                concluidos,
+                                tecnicos,
+                            )
                         ),
                     }
                     for p in fila
@@ -764,45 +601,35 @@ def executar() -> int:
             print("=" * 72)
 
             print(
-                f"API total:                    "
-                f"{len(base_api)}"
+                f"Pendentes retornados pela API: "
+                f"{ULTIMO_TOTAL_PENDENTES_API}"
             )
 
             print(
-                f"Pendentes fotografados:       "
-                f"{len(cpfs_pendentes)}"
+                f"Itens inválidos ignorados:     "
+                f"{len(ULTIMOS_ITENS_INVALIDOS)}"
             )
 
             print("-" * 72)
 
             print(
-                f"Novos para consultar:         "
-                f"{contagem['fila_NOVO']}"
+                f"Novos:                        "
+                f"{contagem['historico_NOVO']}"
             )
 
             print(
-                f"Falhas técnicas para rever:   "
-                f"{contagem['fila_FALHA_TECNICA']}"
+                f"Falhas técnicas:              "
+                f"{contagem['historico_FALHA_TECNICA']}"
             )
 
             print(
                 f"Concluídos ainda Pendentes:   "
-                f"{contagem['fila_CONCLUIDO_PENDENTE']}"
+                f"{contagem['historico_CONCLUIDO_MAS_AINDA_PENDENTE']}"
             )
 
             print(
                 f"Dados insuficientes:          "
                 f"{contagem['dados_insuficientes']}"
-            )
-
-            print(
-                f"Movidos durante varredura:    "
-                f"{contagem['movido_durante_varredura']}"
-            )
-
-            print(
-                f"Pendentes fora da API:        "
-                f"{contagem['sem_api']}"
             )
 
             print()
@@ -834,8 +661,8 @@ def executar() -> int:
                 return 0
 
             resposta = input(
-                "\nDigite S para começar a consultar "
-                "essa fila. Qualquer outra tecla "
+                "\nDigite S para começar... "
+                "Qualquer outra tecla "
                 "encerra apenas com a auditoria: "
             ).strip().upper()
 

@@ -11,12 +11,10 @@ echo.
 echo Esta rotina vai:
 echo.
 echo  1. Ler os consultas.csv dos operadores 0, 1, 2 e 3
-echo  2. Consultar a base atual do CRM
-echo  3. Varrer todas as abas do CRM
-echo  4. Remover quem ja foi concluido
-echo  5. Ignorar quem outra maquina ja resolveu
-echo  6. Validar nome, CPF, nome da mae e nascimento
-echo  7. Montar uma fila somente com novos e falhas tecnicas
+echo  2. Fotografar todos os Pendentes pela API do CRM
+echo  3. Validar nome, CPF, nome da mae e nascimento
+echo  4. Classificar cada Pendente pelo historico dos operadores
+echo  5. Gerar a auditoria e a fila da fotografia atual
 echo.
 echo Nenhuma consulta ao TSE sera iniciada sem confirmacao.
 echo ================================================================
