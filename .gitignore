@@ -23,3 +23,4 @@ dist/
 
 # Perfis e relatorios separados da versao com varios terminais.
 multi-instancia/dados/
+varredura-final/dados/

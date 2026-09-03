@@ -572,24 +572,6 @@ def montar_fila(
 
             continue
 
-        # Já foi realmente consultado.
-        # Inclusive Não encontrado real.
-        if historico == "CONCLUIDO":
-            contagem["concluido_pendente"] += 1
-
-            auditoria.append({
-                "cpf": cpf,
-                "historico": historico,
-                "aba_atual": aba,
-                "acao": "NAO_REPROCESSAR",
-                "observacao": (
-                    "Já consta como consulta conclusiva "
-                    "nos históricos dos operadores."
-                ),
-            })
-
-            continue
-
         print(
             f"\nValidando dados [{indice}/{len(base_api)}] "
             f"CPF {cpf}"
