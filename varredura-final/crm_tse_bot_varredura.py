@@ -14,14 +14,7 @@ from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
 
 TOTAL_OPERADORES = 4
 
-ABAS = (
-    "Pendentes",
-    "Já validados",
-    "Fora da cidade",
-    "Dados incompletos",
-    "Não encontrados",
-    "Revisar",
-)
+ABA_PENDENTES = "Pendentes"
 
 VALORES_SEM_DADO = {
     "",
@@ -403,39 +396,6 @@ def inventariar_aba(page: Page, aba: str) -> set[str]:
 
     return cpfs
 
-
-def inventariar_todas_abas(
-    page: Page,
-) -> tuple[dict[str, str], dict[str, int]]:
-
-    mapa: dict[str, str] = {}
-    totais: dict[str, int] = {}
-
-    for aba in ABAS:
-        cpfs = inventariar_aba(page, aba)
-
-        totais[aba] = len(cpfs)
-
-        for cpf in cpfs:
-            anterior = mapa.get(cpf)
-
-            if anterior:
-                print(
-                    f"AVISO: CPF {cpf} apareceu em "
-                    f"{anterior!r} e {aba!r}."
-                )
-
-                # Em situação concorrente, Pendentes ganha
-                # prioridade para a análise posterior.
-                if aba == "Pendentes":
-                    mapa[cpf] = aba
-
-            else:
-                mapa[cpf] = aba
-
-    return mapa, totais
-
-
 # ------------------------------------------------------------
 # VALIDAÇÃO AO VIVO DOS PENDENTES
 # ------------------------------------------------------------
@@ -507,11 +467,10 @@ def salvar_csv(
 # MONTAGEM DA FILA
 # ------------------------------------------------------------
 
-
 def montar_fila(
     page: Page,
     base_api: list[bot.Pessoa],
-    mapa_abas: dict[str, str],
+    cpfs_pendentes: set[str],
     concluidos: set[str],
     tecnicos: set[str],
 ) -> tuple[
@@ -522,14 +481,26 @@ def montar_fila(
 
     fila: list[bot.Pessoa] = []
     auditoria: list[dict[str, str]] = []
-
     contagem: Counter = Counter()
 
-    for indice, referencia in enumerate(
-        base_api,
+    # Mapa rápido da fotografia inicial da API.
+    base_por_cpf = {
+        pessoa.cpf: pessoa
+        for pessoa in base_api
+        if pessoa.cpf
+    }
+
+    print()
+    print(
+        f"CPFs presentes em Pendentes agora: "
+        f"{len(cpfs_pendentes)}"
+    )
+
+    for indice, cpf in enumerate(
+        sorted(cpfs_pendentes),
         start=1,
     ):
-        cpf = referencia.cpf
+        referencia = base_por_cpf.get(cpf)
 
         if cpf in concluidos:
             historico = "CONCLUIDO"
@@ -538,42 +509,24 @@ def montar_fila(
         else:
             historico = "NOVO"
 
-        aba = mapa_abas.get(cpf)
-
-        if aba is None:
-            acao = "STATUS_DESCONHECIDO"
-
-            contagem["desconhecido"] += 1
+        if referencia is None:
+            contagem["sem_api"] += 1
 
             auditoria.append({
                 "cpf": cpf,
                 "historico": historico,
-                "aba_atual": "",
-                "acao": acao,
+                "aba_atual": "Pendentes",
+                "acao": "SEM_REGISTRO_API",
                 "observacao": (
-                    "CPF existe na API, mas não apareceu "
-                    "em nenhuma aba."
+                    "CPF apareceu em Pendentes, mas não estava "
+                    "na fotografia inicial da API."
                 ),
             })
 
             continue
 
-        # Qualquer aba que não seja Pendentes encerra.
-        if aba != "Pendentes":
-            contagem[f"aba_{aba}"] += 1
-
-            auditoria.append({
-                "cpf": cpf,
-                "historico": historico,
-                "aba_atual": aba,
-                "acao": "ENCERRADO",
-                "observacao": "",
-            })
-
-            continue
-
         print(
-            f"\nValidando dados [{indice}/{len(base_api)}] "
+            f"\nValidando [{indice}/{len(cpfs_pendentes)}] "
             f"CPF {cpf}"
         )
 
@@ -584,43 +537,56 @@ def montar_fila(
 
         if pessoa is None:
             if problema == "não está mais em Pendentes":
-                acao = "MOVIDO_DURANTE_VARREDURA"
                 contagem["movido_durante_varredura"] += 1
+
+                auditoria.append({
+                    "cpf": cpf,
+                    "historico": historico,
+                    "aba_atual": "Pendentes",
+                    "acao": "MOVIDO_DURANTE_VARREDURA",
+                    "observacao": (
+                        "Outra máquina ou processo retirou "
+                        "o CPF de Pendentes durante a auditoria."
+                    ),
+                })
+
             else:
-                acao = "DADOS_INSUFICIENTES"
                 contagem["dados_insuficientes"] += 1
 
-            auditoria.append({
-                "cpf": cpf,
-                "historico": historico,
-                "aba_atual": aba,
-                "acao": acao,
-                "observacao": problema,
-            })
+                auditoria.append({
+                    "cpf": cpf,
+                    "historico": historico,
+                    "aba_atual": "Pendentes",
+                    "acao": "DADOS_INSUFICIENTES",
+                    "observacao": problema,
+                })
 
             continue
 
         fila.append(pessoa)
 
-        origem = (
-            "FALHA_TECNICA"
-            if historico == "FALHA_TECNICA"
-            else "NOVO"
-        )
+        if historico == "FALHA_TECNICA":
+            contagem["fila_FALHA_TECNICA"] += 1
+
+        elif historico == "CONCLUIDO":
+            # O histórico dizia concluído, mas o CRM atual ainda
+            # mantém a pessoa em Pendentes. O estado atual vence.
+            contagem["fila_CONCLUIDO_PENDENTE"] += 1
+
+        else:
+            contagem["fila_NOVO"] += 1
 
         contagem["fila"] += 1
-        contagem[f"fila_{origem}"] += 1
 
         auditoria.append({
             "cpf": cpf,
             "historico": historico,
-            "aba_atual": aba,
+            "aba_atual": "Pendentes",
             "acao": "PROCESSAR",
             "observacao": "",
         })
 
     return fila, auditoria, contagem
-
 
 # ------------------------------------------------------------
 # EXECUÇÃO
@@ -731,19 +697,25 @@ def executar() -> int:
 
             print()
             print(
-                "Agora vou atravessar TODAS "
-                "as abas do CRM."
+                "Fotografando somente a aba Pendentes..."
             )
 
-            mapa_abas, totais_abas = (
-                inventariar_todas_abas(crm)
+            cpfs_pendentes = inventariar_aba(
+                crm,
+                ABA_PENDENTES,
+            )
+
+            print()
+            print(
+                f"Pendentes encontrados: "
+                f"{len(cpfs_pendentes)}"
             )
 
             fila, auditoria, contagem = (
                 montar_fila(
                     crm,
                     base_api,
-                    mapa_abas,
+                    cpfs_pendentes,
                     concluidos,
                     tecnicos,
                 )
@@ -796,11 +768,10 @@ def executar() -> int:
                 f"{len(base_api)}"
             )
 
-            for aba in ABAS:
-                print(
-                    f"{aba:<29} "
-                    f"{totais_abas.get(aba, 0)}"
-                )
+            print(
+                f"Pendentes fotografados:       "
+                f"{len(cpfs_pendentes)}"
+            )
 
             print("-" * 72)
 
@@ -815,6 +786,11 @@ def executar() -> int:
             )
 
             print(
+                f"Concluídos ainda Pendentes:   "
+                f"{contagem['fila_CONCLUIDO_PENDENTE']}"
+            )
+
+            print(
                 f"Dados insuficientes:          "
                 f"{contagem['dados_insuficientes']}"
             )
@@ -825,8 +801,8 @@ def executar() -> int:
             )
 
             print(
-                f"Status desconhecido:          "
-                f"{contagem['desconhecido']}"
+                f"Pendentes fora da API:        "
+                f"{contagem['sem_api']}"
             )
 
             print()
