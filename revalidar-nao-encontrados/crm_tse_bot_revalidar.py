@@ -483,6 +483,24 @@ def confirmar_em_aba(page: Page, aba: str, cpf: str) -> ConfirmacaoAba:
 def selecionar_registro_externo(payload: Any, cpf: str) -> dict[str, Any]:
     candidatos: list[dict[str, Any]] = []
     if isinstance(payload, dict):
+        status_envelope = payload.get("statusCode")
+        if status_envelope is not None:
+            try:
+                status_envelope = int(status_envelope)
+            except (TypeError, ValueError):
+                raise ErroTecnico(
+                    "fonte autorizada devolveu statusCode inválido"
+                ) from None
+            if status_envelope != 200:
+                raise ErroTecnico(
+                    f"fonte autorizada devolveu statusCode {status_envelope}"
+                )
+
+        # Formato principal confirmado pelo provedor:
+        # {"statusCode": 200, "body": {"cpf": ..., "name": ...}}
+        body = payload.get("body")
+        if isinstance(body, dict):
+            candidatos.append(body)
         candidatos.append(payload)
         for chave in ("data", "item", "result"):
             valor = payload.get(chave)
@@ -618,15 +636,15 @@ def obter_dados_autorizados(
                 cpf=cpf,
                 nome=primeiro_valor(
                     item,
-                    ("nome", "name", "nome_completo", "full_name"),
+                    ("name", "nome", "nome_completo", "full_name"),
                 ),
                 mae=primeiro_valor(
                     item,
-                    ("nome_mae", "nome_da_mae", "mae", "mother_name"),
+                    ("mother_name", "nome_mae", "nome_da_mae", "mae"),
                 ),
                 nascimento=bot.normalizar_nascimento_api(primeiro_valor(
                     item,
-                    ("nascimento", "data_nascimento", "birth_date", "date_of_birth"),
+                    ("birth_date", "nascimento", "data_nascimento", "date_of_birth"),
                 )),
             )
         except KeyboardInterrupt:
