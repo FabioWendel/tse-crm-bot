@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 
 if /i "%~1"=="start" goto :start
 if /i "%~1"=="stop" goto :stop
