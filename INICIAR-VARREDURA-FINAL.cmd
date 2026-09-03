@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 title CRM x TSE - VARREDURA FINAL
 
@@ -26,6 +27,7 @@ if exist ".venv\Scripts\python.exe" (
     python "varredura-final\crm_tse_bot_varredura.py"
 )
 
+call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 echo ================================================================
 echo Processo encerrado.

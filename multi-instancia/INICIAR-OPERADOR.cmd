@@ -11,6 +11,7 @@ set "OPERADOR=%~1"
 set "PASTA_MULTI=%~dp0"
 set "RAIZ=%~dp0.."
 pushd "%RAIZ%"
+call "%~dp0..\scripts\focus_shield_client.cmd" start "%~dp0.."
 
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" "multi-instancia\crm_tse_bot_multi.py" "%OPERADOR%"
@@ -20,5 +21,6 @@ if exist ".venv\Scripts\python.exe" (
     echo Ambiente Python nao encontrado. Instale as dependencias na pasta principal.
 )
 
+call "%~dp0..\scripts\focus_shield_client.cmd" stop
 popd
 pause

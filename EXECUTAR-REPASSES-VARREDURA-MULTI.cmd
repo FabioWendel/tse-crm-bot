@@ -22,6 +22,7 @@ if "%~1"=="" (
 
 set "OPERADOR=%~1"
 title REPASSE VARREDURA MULTI - OPERADOR %OPERADOR%
+call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" "varredura-final-multi\crm_tse_bot_repasse_multi.py" "%OPERADOR%"
@@ -31,5 +32,6 @@ if exist ".venv\Scripts\python.exe" (
     echo Ambiente Python nao encontrado.
 )
 
+call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 pause

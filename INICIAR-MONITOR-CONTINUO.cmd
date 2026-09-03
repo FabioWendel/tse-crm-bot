@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 title MONITOR CONTINUO CRM x TSE
 
@@ -26,6 +27,7 @@ if exist ".venv\Scripts\python.exe" (
     python "monitor-continuo\crm_tse_bot_monitor.py"
 )
 
+call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 echo ================================================================
 echo Monitor encerrado.
