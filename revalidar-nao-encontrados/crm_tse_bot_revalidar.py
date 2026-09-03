@@ -6,9 +6,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -24,12 +27,19 @@ MAX_PAGINAS = 1000
 TENTATIVAS_API = 3
 PAUSA_API_MS = 1000
 RESUMO_A_CADA = 10
+MAX_REQUISICOES_EXTERNAS_POR_MINUTO = 14
+INTERVALO_API_EXTERNA_S = max(
+    60.0 / MAX_REQUISICOES_EXTERNAS_POR_MINUTO,
+    4.4,
+)
 
 PASTA_ATUAL = Path(__file__).resolve().parent
 RAIZ = PASTA_ATUAL.parent
 PASTA_DADOS = PASTA_ATUAL / "dados"
 PASTA_FILA = PASTA_DADOS / "fila"
 API_VALIDAR_LOCAL = "https://juniorveloso.com.br/cadastrante/api/validar-local"
+RATE_LIMIT_LOCK = PASTA_DADOS / "api_rate_limit.lock"
+RATE_LIMIT_STATE = PASTA_DADOS / "api_rate_limit.json"
 
 ENV_URL = "ENRICHMENT_API_URL"
 ENV_TOKEN = "ENRICHMENT_API_TOKEN"
@@ -125,6 +135,115 @@ class ErroTecnico(RuntimeError):
 
 class EstadoMudou(RuntimeError):
     pass
+
+
+@contextmanager
+def bloquear_arquivo_compartilhado(caminho: Path):
+    """Lock multiprocesso liberado automaticamente se um processo encerrar."""
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with caminho.open("a+b") as arquivo:
+        if arquivo.tell() == 0 and caminho.stat().st_size == 0:
+            arquivo.write(b"0")
+            arquivo.flush()
+
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    arquivo.seek(0)
+                    msvcrt.locking(arquivo.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        else:
+            import fcntl
+
+            fcntl.flock(arquivo.fileno(), fcntl.LOCK_EX)
+
+        try:
+            yield
+        finally:
+            arquivo.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(arquivo.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(arquivo.fileno(), fcntl.LOCK_UN)
+
+
+class RateLimiterGlobal:
+    """Agenda requisições externas em uma linha do tempo única entre processos."""
+
+    def __init__(self, operador: int, execucao_id: str):
+        self.operador = operador
+        self.execucao_id = execucao_id
+
+    @staticmethod
+    def _ler_estado() -> dict[str, Any]:
+        try:
+            with RATE_LIMIT_STATE.open("r", encoding="utf-8") as arquivo:
+                estado = json.load(arquivo)
+            if isinstance(estado, dict):
+                return estado
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    @staticmethod
+    def _salvar_estado(estado: dict[str, Any]) -> None:
+        temporario = RATE_LIMIT_STATE.with_name(
+            f"{RATE_LIMIT_STATE.name}.{os.getpid()}.tmp"
+        )
+        with temporario.open("w", encoding="utf-8") as arquivo:
+            json.dump(estado, arquivo, ensure_ascii=True)
+            arquivo.flush()
+            os.fsync(arquivo.fileno())
+        temporario.replace(RATE_LIMIT_STATE)
+
+    def aguardar_e_reservar(self) -> int:
+        avisou = False
+        while True:
+            espera = 0.0
+            with bloquear_arquivo_compartilhado(RATE_LIMIT_LOCK):
+                estado = self._ler_estado()
+                agora_epoch = time.time()
+                proxima = float(estado.get("proxima_liberacao", 0.0) or 0.0)
+                espera = max(proxima - agora_epoch, 0.0)
+                if espera <= 0:
+                    contagens = estado.get("requests_por_execucao")
+                    if not isinstance(contagens, dict):
+                        contagens = {}
+                    total = int(contagens.get(self.execucao_id, 0) or 0) + 1
+                    contagens[self.execucao_id] = total
+                    # Evita crescimento ilimitado sem afetar a janela global.
+                    if len(contagens) > 20:
+                        contagens = dict(list(contagens.items())[-20:])
+                    estado = {
+                        "proxima_liberacao": agora_epoch + INTERVALO_API_EXTERNA_S,
+                        "requests_por_execucao": contagens,
+                    }
+                    self._salvar_estado(estado)
+                    print(f"[API EXTERNA] operador {self.operador} liberado")
+                    return total
+
+            if not avisou:
+                print(
+                    "[API EXTERNA] aguardando rate limit global... "
+                    f"({espera:.1f}s)"
+                )
+                avisou = True
+            time.sleep(min(max(espera, 0.1), 1.0))
+
+    def adiar_global(self, segundos: float) -> None:
+        atraso = max(float(segundos), INTERVALO_API_EXTERNA_S)
+        with bloquear_arquivo_compartilhado(RATE_LIMIT_LOCK):
+            estado = self._ler_estado()
+            agora_epoch = time.time()
+            atual = float(estado.get("proxima_liberacao", 0.0) or 0.0)
+            estado["proxima_liberacao"] = max(atual, agora_epoch + atraso)
+            if not isinstance(estado.get("requests_por_execucao"), dict):
+                estado["requests_por_execucao"] = {}
+            self._salvar_estado(estado)
 
 
 def agora() -> str:
@@ -388,6 +507,37 @@ def selecionar_registro_externo(payload: Any, cpf: str) -> dict[str, Any]:
     raise ErroTecnico("fonte autorizada não devolveu o CPF solicitado")
 
 
+def resposta_explicita_sem_dados(payload: Any) -> bool:
+    """Aceita apenas marcadores inequívocos; formato inesperado continua técnico."""
+    candidatos = [payload]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        candidatos.append(payload["data"])
+    for candidato in candidatos:
+        if not isinstance(candidato, dict):
+            continue
+        for chave in ("found", "encontrado", "exists", "existe"):
+            if candidato.get(chave) is False:
+                return True
+        status = bot.normalize_text(str(candidato.get("status") or ""))
+        if status in {"NAO ENCONTRADO", "NOT FOUND", "SEM DADOS", "NO DATA"}:
+            return True
+    return False
+
+
+def segundos_retry_after(headers: dict[str, str]) -> float:
+    valor = str(headers.get("retry-after") or headers.get("Retry-After") or "").strip()
+    if not valor:
+        return INTERVALO_API_EXTERNA_S
+    try:
+        return max(float(valor), INTERVALO_API_EXTERNA_S)
+    except ValueError:
+        try:
+            instante = parsedate_to_datetime(valor)
+            return max(instante.timestamp() - time.time(), INTERVALO_API_EXTERNA_S)
+        except (TypeError, ValueError, OverflowError):
+            return INTERVALO_API_EXTERNA_S
+
+
 def primeiro_valor(item: dict[str, Any], nomes: tuple[str, ...]) -> str:
     for nome in nomes:
         valor = item.get(nome)
@@ -401,42 +551,99 @@ def obter_dados_autorizados(
     cpf: str,
     url_base: str,
     token: str,
+    rate_limiter: RateLimiterGlobal,
 ) -> DadosConsulta:
     cpf = bot.only_digits(cpf)
     url = url_base.replace("{cpf}", quote(cpf, safe=""))
     params = None if "{cpf}" in url_base else {"cpf": cpf}
-    try:
-        payload = requisitar_json(
-            page,
-            url,
-            params=params,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            timeout=45000,
-        )
-    except KeyboardInterrupt:
-        raise
-    except Exception:
-        # Não propaga detalhes internos da requisição para impedir que
-        # cabeçalhos ou uma URL mal configurada apareçam no traceback.
-        raise ErroTecnico("fonte autorizada indisponível ou resposta inválida") from None
-    item = selecionar_registro_externo(payload, cpf)
-    # Somente estes quatro valores deixam esta função. O JSON bruto não é
-    # impresso, salvo nem devolvido ao restante do programa.
-    return DadosConsulta(
-        cpf=cpf,
-        nome=primeiro_valor(item, ("nome", "name", "nome_completo", "full_name")),
-        mae=primeiro_valor(
-            item,
-            ("nome_mae", "nome_da_mae", "mae", "mother_name"),
-        ),
-        nascimento=bot.normalizar_nascimento_api(primeiro_valor(
-            item,
-            ("nascimento", "data_nascimento", "birth_date", "date_of_birth"),
-        )),
-    )
+    ultimo_erro = "fonte autorizada indisponível ou resposta inválida"
+
+    for tentativa in range(1, 4):
+        resposta = None
+        total_execucao = rate_limiter.aguardar_e_reservar()
+        print(f"[API EXTERNA] requests desta execução: {total_execucao}")
+        try:
+            resposta = page.request.get(
+                url,
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=45000,
+            )
+            print(f"[API EXTERNA] CPF {cpf} consultado")
+
+            if resposta.status == 429:
+                espera = segundos_retry_after(resposta.headers)
+                rate_limiter.adiar_global(espera)
+                ultimo_erro = f"HTTP 429; nova tentativa após {espera:.1f}s"
+                if tentativa < 3:
+                    print(f"[API EXTERNA] {ultimo_erro}")
+                    continue
+                break
+
+            payload = None
+            try:
+                payload = resposta.json()
+            except Exception:
+                if resposta.status == 200:
+                    ultimo_erro = "HTTP 200 com JSON inválido"
+                    if tentativa < 3:
+                        continue
+                    break
+
+            if resposta.status != 200:
+                if resposta.status == 404 and resposta_explicita_sem_dados(payload):
+                    return DadosConsulta(cpf=cpf, nome="", mae="", nascimento="")
+                ultimo_erro = f"HTTP {resposta.status} da fonte autorizada"
+                if resposta.status >= 500 and tentativa < 3:
+                    continue
+                break
+
+            if resposta_explicita_sem_dados(payload):
+                return DadosConsulta(cpf=cpf, nome="", mae="", nascimento="")
+
+            try:
+                item = selecionar_registro_externo(payload, cpf)
+            except ErroTecnico:
+                ultimo_erro = "resposta válida, mas sem registro correspondente ao CPF"
+                if tentativa < 3:
+                    continue
+                break
+
+            # Somente estes quatro valores deixam esta função. O JSON bruto não
+            # é impresso, salvo nem devolvido ao restante do programa.
+            return DadosConsulta(
+                cpf=cpf,
+                nome=primeiro_valor(
+                    item,
+                    ("nome", "name", "nome_completo", "full_name"),
+                ),
+                mae=primeiro_valor(
+                    item,
+                    ("nome_mae", "nome_da_mae", "mae", "mother_name"),
+                ),
+                nascimento=bot.normalizar_nascimento_api(primeiro_valor(
+                    item,
+                    ("nascimento", "data_nascimento", "birth_date", "date_of_birth"),
+                )),
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            # Não propaga URL/cabeçalhos da biblioteca para logs ou traceback.
+            ultimo_erro = "timeout, rede interrompida ou falha na fonte autorizada"
+            if tentativa < 3:
+                continue
+        finally:
+            if resposta is not None:
+                try:
+                    resposta.dispose()
+                except Exception:
+                    pass
+
+    raise ErroTecnico(ultimo_erro) from None
 
 
 def validar_dados(dados: DadosConsulta) -> tuple[bool, str]:
@@ -727,6 +934,7 @@ def processar_trabalho(
     trabalho: Trabalho,
     url_externa: str,
     token: str,
+    rate_limiter: RateLimiterGlobal,
     contadores: Contadores,
     resultados: list[dict[str, Any]],
     divergencias: dict[str, dict[str, Any]],
@@ -782,6 +990,7 @@ def processar_trabalho(
                     cpf,
                     url_externa,
                     token,
+                    rate_limiter,
                 )
                 origem = "fonte_autorizada"
                 contadores.unico("dados_externos_ok", cpf)
@@ -893,8 +1102,13 @@ def mostrar_progresso(contadores: Contadores) -> None:
     print("=" * 72)
 
 
-def executar_operador(operador: int, caminho_fila: Path) -> int:
+def executar_operador(
+    operador: int,
+    caminho_fila: Path,
+    execucao_id: str,
+) -> int:
     url_externa, token = exigir_configuracao_externa()
+    rate_limiter = RateLimiterGlobal(operador, execucao_id)
     dados = configurar_operador(operador)
     fila = [
         Trabalho(pessoa)
@@ -945,6 +1159,7 @@ def executar_operador(operador: int, caminho_fila: Path) -> int:
                 salvar_repasse_operador(dados, repasse_persistido)
                 sucesso = processar_trabalho(
                     playwright, context, crm, trabalho, url_externa, token,
+                    rate_limiter,
                     contadores, resultados, divergencias, incompletos,
                     vindo_repasse=False,
                 )
@@ -961,6 +1176,7 @@ def executar_operador(operador: int, caminho_fila: Path) -> int:
             for trabalho in itens_repasse:
                 sucesso = processar_trabalho(
                     playwright, context, crm, trabalho, url_externa, token,
+                    rate_limiter,
                     contadores, resultados, divergencias, incompletos,
                     vindo_repasse=True,
                 )
@@ -1109,6 +1325,7 @@ def executar_coordenador() -> int:
         return 0
 
     inicio_execucao = agora()
+    execucao_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     processos: list[subprocess.Popen[Any]] = []
     for operador in range(TOTAL_OPERADORES):
         comando = [
@@ -1118,6 +1335,8 @@ def executar_coordenador() -> int:
             str(operador),
             "--fila",
             str(caminho_fila),
+            "--execucao",
+            execucao_id,
         ]
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -1135,6 +1354,7 @@ def argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--operador", type=int, choices=range(TOTAL_OPERADORES))
     parser.add_argument("--fila", type=Path)
+    parser.add_argument("--execucao")
     return parser.parse_args()
 
 
@@ -1142,9 +1362,13 @@ def main() -> int:
     args = argumentos()
     if args.operador is None:
         return executar_coordenador()
-    if args.fila is None:
-        raise SystemExit("O operador interno precisa receber --fila.")
-    return executar_operador(args.operador, args.fila.resolve())
+    if args.fila is None or not args.execucao:
+        raise SystemExit("O operador interno precisa receber --fila e --execucao.")
+    return executar_operador(
+        args.operador,
+        args.fila.resolve(),
+        args.execucao,
+    )
 
 
 if __name__ == "__main__":
