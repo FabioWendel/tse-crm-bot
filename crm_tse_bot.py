@@ -10,6 +10,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -18,6 +19,7 @@ from playwright.sync_api import BrowserContext, Error, Page, TimeoutError, sync_
 
 CRM_URL = "https://juniorveloso.com.br/cadastrante/validar-local"
 CRM_ELEITORES_API_URL = "https://juniorveloso.com.br/cadastrante/api/eleitores"
+CRM_VALIDAR_LOCAL_API_URL = "https://juniorveloso.com.br/cadastrante/api/validar-local"
 TSE_URL = "https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/"
 FILA_ORIGEM_LABEL = "Base estatica da API"
 FILA_VAZIA_MSG = "A API do CRM nao devolveu eleitores para montar as fatias."
@@ -72,12 +74,6 @@ ENTRADA_MANUAL_TIMEOUT_S = 120  # perguntas durante uma pessoa nunca param a fil
 PERGUNTAR_NO_TERMINAL = False
 ESPERA_LOGIN_MS = 600000  # 10 min para o operador logar no CRM, sem pedir Enter
 TSE_NO_CHROME_NORMAL = True  # usa Chrome separado, preenche a consulta e deixa CAPTCHA manual
-
-# Quando o TSE responde que nao localizou o eleitor, o bot clica "Nao achei" na linha do CRM.
-# Ja quando a consulta nem chegou a acontecer (CAPTCHA indisponivel, tela travada, timeout),
-# o padrao e NAO marcar nada: falha nossa nao e ausencia de cadastro no TSE.
-# Ponha True se preferir marcar "Nao achei" tambem nesses casos.
-MARCAR_NAO_ACHEI_EM_ERRO_TECNICO = False
 
 # Pessoa com situacao irregular (cancelado, suspenso, biometria etc.) mas COM local
 # de votacao: False salva no CRM direto, True volta a pedir confirmacao no terminal.
@@ -162,6 +158,19 @@ class ResultadoTse:
     # True quando o TSE de fato respondeu (achando ou negando). False quando a
     # consulta nao chegou a completar por CAPTCHA/timeout/tela travada.
     resposta_do_tse: bool = True
+
+
+class EstadoPendente(str, Enum):
+    PENDENTE = "PENDENTE"
+    FORA_DE_PENDENTES = "FORA_DE_PENDENTES"
+    INDETERMINADO = "INDETERMINADO"
+
+
+@dataclass
+class ConfirmacaoPendente:
+    estado: EstadoPendente
+    pessoa: Pessoa | None = None
+    detalhe: str = ""
 
 
 _TSE_BROWSER = None
@@ -390,12 +399,20 @@ def processar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: P
 
 
 def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pessoa) -> bool:
-    # Rele a linha agora: entre o inventario e este momento outro operador
-    # pode ter tratado a pessoa, e os dados podem ter mudado.
-    pessoa = abrir_pessoa_por_cpf(crm, pendente)
-    if not pessoa:
-        print("Essa pessoa nao esta mais em Pendentes (outro operador tratou?). Pulando.")
+    # O estado e os dados atuais vêm da API. A interface só é sincronizada para
+    # executar a ação depois que a API confirma que o CPF continua Pendente.
+    confirmacao = abrir_pessoa_por_cpf(crm, pendente)
+    if confirmacao.estado == EstadoPendente.FORA_DE_PENDENTES:
+        print("A API confirmou que essa pessoa não está mais em Pendentes. Pulando.")
         return True
+    if confirmacao.estado == EstadoPendente.INDETERMINADO:
+        raise RuntimeError(
+            "Não foi possível determinar com segurança o estado do CPF no CRM: "
+            + confirmacao.detalhe
+        )
+    pessoa = confirmacao.pessoa
+    if pessoa is None:
+        raise RuntimeError("A API confirmou o CPF, mas não devolveu os dados da pessoa.")
 
     campos_ausentes = []
     if campo_sem_informacao(pessoa.mae):
@@ -415,17 +432,15 @@ def tratar_pessoa(playwright, context: BrowserContext, crm: Page, pendente: Pess
             resposta_do_tse=False,
         )
         append_log(pessoa, resultado)
-        if marcar_nao_achei(crm, pessoa):
-            return True
-        print("Nao confirmei a acao 'Nao achei'. A pessoa continua pendente.")
-        return False
+        print("Cadastro mantido em Pendentes para correção dos dados no CRM.")
+        return True
 
     resultado = consultar_tse(playwright, context, pessoa)
     try:
         append_log(pessoa, resultado)
 
         if not resultado.encontrado:
-            if resultado.resposta_do_tse or MARCAR_NAO_ACHEI_EM_ERRO_TECNICO:
+            if resultado.resposta_do_tse is True and resultado.encontrado is False:
                 print("TSE nao devolveu local de votacao. Vou marcar 'Nao achei' no CRM.")
                 if marcar_nao_achei(crm, pessoa):
                     return True
@@ -759,25 +774,164 @@ def maximizar_por_pagina(page: Page) -> None:
             continue
 
 
-def abrir_pessoa_por_cpf(page: Page, pendente: Pessoa) -> Pessoa | None:
-    """Filtra Pendentes pelo CPF e rele os dados da linha.
+def normalizar_nascimento_api(valor: object) -> str:
+    texto = str(valor or "").strip()
+    for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(texto, formato).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return ""
 
-    Buscar em vez de usar a posicao guardada e o que torna a execucao paralela
-    segura: a linha e achada mesmo que esteja na pagina 30, e nunca se escreve
-    numa pessoa que apenas herdou o indice de outra.
-    """
+
+def confirmar_pendente_por_api(page: Page, cpf: str) -> ConfirmacaoPendente:
+    """Confirma um CPF em Pendentes sem transformar falha de API em ausência."""
+    cpf_procurado = only_digits(cpf)
+    if len(cpf_procurado) != 11:
+        return ConfirmacaoPendente(
+            EstadoPendente.INDETERMINADO,
+            detalhe="CPF inválido para consulta na API.",
+        )
+
+    houve_erro = False
+    detalhes_erro: list[str] = []
+
+    for tentativa in range(1, 4):
+        resposta = None
+        try:
+            resposta = page.request.get(
+                CRM_VALIDAR_LOCAL_API_URL,
+                params={
+                    "aba": "pendentes",
+                    "q": cpf_procurado,
+                    "page": 1,
+                    "per_page": 25,
+                    "sort": "nome",
+                    "dir": "asc",
+                },
+                headers={"Accept": "application/json"},
+                timeout=30000,
+            )
+            if resposta.status != 200:
+                raise RuntimeError(
+                    f"API de Pendentes respondeu HTTP {resposta.status}"
+                )
+
+            payload = resposta.json()
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
+                items = payload["items"]
+            else:
+                raise RuntimeError(
+                    "API de Pendentes devolveu JSON sem lista de itens"
+                )
+
+            item_invalido = False
+            for item in items:
+                if not isinstance(item, dict):
+                    item_invalido = True
+                    continue
+                cpf_item = only_digits(str(item.get("cpf") or ""))
+                if cpf_item != cpf_procurado:
+                    continue
+                try:
+                    crm_id = int(item.get("id"))
+                except (TypeError, ValueError):
+                    crm_id = None
+                pessoa = Pessoa(
+                    row_index=-1,
+                    nome=clean_person_name(str(item.get("nome") or "")),
+                    cpf=cpf_item,
+                    mae=clean(str(item.get("nome_da_mae") or "")),
+                    nascimento=normalizar_nascimento_api(item.get("nascimento")),
+                    crm_id=crm_id,
+                )
+                return ConfirmacaoPendente(
+                    EstadoPendente.PENDENTE,
+                    pessoa=pessoa,
+                    detalhe=f"CPF confirmado na tentativa {tentativa}.",
+                )
+            if item_invalido:
+                raise RuntimeError(
+                    "API de Pendentes devolveu item em formato inválido"
+                )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            houve_erro = True
+            detalhes_erro.append(
+                f"tentativa {tentativa}: {resumo_erro(exc)}"
+            )
+        finally:
+            if resposta is not None:
+                resposta.dispose()
+
+        if tentativa < 3:
+            try:
+                page.wait_for_timeout(1000)
+            except Error as exc:
+                houve_erro = True
+                detalhes_erro.append(f"espera entre tentativas: {resumo_erro(exc)}")
+                break
+
+    if houve_erro:
+        return ConfirmacaoPendente(
+            EstadoPendente.INDETERMINADO,
+            detalhe="; ".join(detalhes_erro),
+        )
+    return ConfirmacaoPendente(
+        EstadoPendente.FORA_DE_PENDENTES,
+        detalhe="Três respostas válidas da API não contiveram o CPF.",
+    )
+
+
+def localizar_linha_cpf_ui(page: Page, cpf: str, timeout_ms: int = 20000):
+    """Filtra a UI e espera o CPF exato aparecer, ou devolve None no timeout."""
+    cpf_procurado = only_digits(cpf)
     voltar_para_pendentes(page)
-    try:
-        fill_search(page, pendente.cpf)
-    except (TimeoutError, Error):
-        print("Nao consegui usar o campo de busca do CRM.")
-        return None
+    fill_search(page, cpf_procurado)
+    limite = time.monotonic() + (timeout_ms / 1000)
 
-    for row_index in range(total_rows(page)):
-        pessoa = read_person_from_row(page, row_index)
-        if pessoa and pessoa.cpf == pendente.cpf:
-            return pessoa
+    while time.monotonic() < limite:
+        try:
+            rows = page.locator("table tbody tr")
+            cpf_idx = header_indexes(page).get(normalize_header("CPF"))
+            if cpf_idx is not None:
+                for indice in range(rows.count()):
+                    cells = rows.nth(indice).locator("td")
+                    if cpf_idx >= cells.count():
+                        continue
+                    cpf_linha = only_digits(
+                        cells.nth(cpf_idx).inner_text(timeout=1500)
+                    )
+                    if cpf_linha == cpf_procurado:
+                        return rows.nth(indice)
+        except TimeoutError:
+            pass
+        page.wait_for_timeout(300)
     return None
+
+
+def abrir_pessoa_por_cpf(
+    page: Page,
+    pendente: Pessoa,
+) -> ConfirmacaoPendente:
+    """Confirma pela API e sincroniza a linha da UI somente para futura ação."""
+    confirmacao = confirmar_pendente_por_api(page, pendente.cpf)
+    if confirmacao.estado != EstadoPendente.PENDENTE:
+        return confirmacao
+
+    if localizar_linha_cpf_ui(page, pendente.cpf) is None:
+        return ConfirmacaoPendente(
+            EstadoPendente.INDETERMINADO,
+            pessoa=confirmacao.pessoa,
+            detalhe=(
+                "API confirmou PENDENTE, mas a linha do CPF não apareceu "
+                "na interface do CRM dentro do prazo."
+            ),
+        )
+    return confirmacao
 
 
 def read_person_from_row(page: Page, row_index: int) -> Pessoa | None:
@@ -1908,6 +2062,25 @@ def has_tse_negative_response(texto: str) -> bool:
     return any(term in normalized for term in negative_terms)
 
 
+def confirmar_saida_de_pendentes(page: Page, cpf: str) -> bool:
+    """Confirma pela API que uma ação realmente retirou o CPF de Pendentes."""
+    for tentativa in range(1, 4):
+        confirmacao = confirmar_pendente_por_api(page, cpf)
+        if confirmacao.estado == EstadoPendente.FORA_DE_PENDENTES:
+            return True
+        if confirmacao.estado == EstadoPendente.INDETERMINADO:
+            print(
+                "Não consegui confirmar a saída de Pendentes pela API: "
+                + confirmacao.detalhe
+            )
+            return False
+        if tentativa < 3:
+            page.wait_for_timeout(1000)
+
+    print("A API confirmou que o CPF continua em Pendentes após a ação no CRM.")
+    return False
+
+
 def marcar_nao_achei(page: Page, pessoa: Pessoa) -> bool:
     """Clica no botao 'Nao achei' da linha da pessoa. Nao abre modal: e um clique so."""
     row = linha_da_pessoa(page, pessoa)
@@ -1932,7 +2105,10 @@ def marcar_nao_achei(page: Page, pessoa: Pessoa) -> bool:
             return False
 
     page.wait_for_timeout(1500)
-    print("Marquei 'Nao achei' no CRM.")
+    if not confirmar_saida_de_pendentes(page, pessoa.cpf):
+        print("Cliquei em 'Nao achei', mas a API não confirmou a saída de Pendentes.")
+        return False
+    print("Marquei 'Nao achei' no CRM e confirmei a saída pela API.")
     return True
 
 
@@ -1943,22 +2119,7 @@ def linha_da_pessoa(page: Page, pessoa: Pessoa):
     linha some de Pendentes a qualquer momento e todas as outras sobem. Escrever
     por indice defasado gravaria no cadastro errado, em silencio.
     """
-    rows = page.locator("table tbody tr")
-    cpf_idx = header_indexes(page).get(normalize_header("CPF"))
-    if cpf_idx is None:
-        print("Nao identifiquei a coluna de CPF na tabela do CRM.")
-        return None
-
-    for idx in range(rows.count()):
-        cells = rows.nth(idx).locator("td")
-        if cpf_idx >= cells.count():
-            continue
-        try:
-            if only_digits(cells.nth(cpf_idx).inner_text(timeout=5000)) == pessoa.cpf:
-                return rows.nth(idx)
-        except (TimeoutError, Error):
-            continue
-    return None
+    return localizar_linha_cpf_ui(page, pessoa.cpf)
 
 
 def atualizar_crm(page: Page, pessoa: Pessoa, texto_resultado: str) -> bool:
@@ -1982,11 +2143,15 @@ def atualizar_crm(page: Page, pessoa: Pessoa, texto_resultado: str) -> bool:
 
     try:
         page.get_by_role("button", name=re.compile(r"Salvar local", re.I)).wait_for(state="hidden", timeout=15000)
-        return True
     except TimeoutError:
         print("Cliquei em salvar, mas o modal nao fechou dentro do tempo esperado. Confira no navegador.")
         click_if_visible(page, page.get_by_role("button", name=re.compile(r"Cancelar|Fechar", re.I)).last)
         return False
+
+    if not confirmar_saida_de_pendentes(page, pessoa.cpf):
+        print("O modal fechou, mas a API não confirmou a saída de Pendentes.")
+        return False
+    return True
 
 
 def motivo_inativacao(resultado: ResultadoTse) -> str:
@@ -2250,9 +2415,15 @@ def campo_sem_informacao(value: str) -> bool:
         "--",
         "NAO INFORMADO",
         "NAO INFORMADA",
+        "SEM VALOR",
+        "SEM DADOS",
         "SEM INFORMACAO",
         "NAO CADASTRADO",
         "NAO CADASTRADA",
+        "N/A",
+        "NA",
+        "NULL",
+        "UNDEFINED",
     }:
         return True
     return any(
