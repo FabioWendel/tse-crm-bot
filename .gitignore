@@ -1,5 +1,8 @@
 .venv/
 .venv*/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 
@@ -26,3 +29,4 @@ multi-instancia/dados/
 varredura-final/dados/
 varredura-final-multi/dados/
 recuperar-rodada/dados/
+revalidar-nao-encontrados/dados/
