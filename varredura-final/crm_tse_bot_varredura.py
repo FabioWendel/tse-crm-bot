@@ -17,6 +17,17 @@ PENDENTES_API_URL = "https://juniorveloso.com.br/cadastrante/api/validar-local"
 PENDENTES_POR_PAGINA = 100
 MAX_PAGINAS_API = 1000
 
+ABAS_CRM_API_CONFIRMADAS = {
+    "Pendentes": "pendentes",
+}
+ABAS_CRM_API_AGUARDANDO_CONFIRMACAO = (
+    "Já validados",
+    "Fora da cidade",
+    "Dados incompletos",
+    "Não encontrados",
+    "Revisar",
+)
+
 ULTIMO_TOTAL_PENDENTES_API = 0
 ULTIMOS_ITENS_INVALIDOS: list[dict[str, str]] = []
 ULTIMOS_DUPLICADOS_API = 0
@@ -237,7 +248,7 @@ def inventariar_pendentes_api(page: Page) -> list[bot.Pessoa]:
             resposta = page.request.get(
                 PENDENTES_API_URL,
                 params={
-                    "aba": "pendentes",
+                    "aba": ABAS_CRM_API_CONFIRMADAS["Pendentes"],
                     "q": "",
                     "page": numero_pagina,
                     "per_page": PENDENTES_POR_PAGINA,
@@ -278,7 +289,9 @@ def inventariar_pendentes_api(page: Page) -> list[bot.Pessoa]:
             for indice, item in enumerate(items, start=1):
                 if not isinstance(item, dict):
                     ULTIMOS_ITENS_INVALIDOS.append({
+                        "id": "",
                         "cpf": "",
+                        "nome": "",
                         "observacao": f"Página {numero_pagina}, item {indice}: não é um objeto JSON.",
                     })
                     continue
@@ -296,7 +309,9 @@ def inventariar_pendentes_api(page: Page) -> list[bot.Pessoa]:
                     problemas.append("CPF ausente ou inválido")
                 if problemas:
                     ULTIMOS_ITENS_INVALIDOS.append({
+                        "id": str(item.get("id") or ""),
                         "cpf": cpf,
+                        "nome": str(item.get("nome") or "").strip(),
                         "observacao": f"Página {numero_pagina}, item {indice}: {', '.join(problemas)}.",
                     })
                     continue
@@ -368,6 +383,7 @@ def salvar_csv(
 # ------------------------------------------------------------
 
 def montar_fila(
+    base_total: list[bot.Pessoa],
     pendentes: list[bot.Pessoa],
     concluidos: set[str],
     tecnicos: set[str],
@@ -381,50 +397,107 @@ def montar_fila(
     auditoria: list[dict[str, str]] = []
     contagem: Counter = Counter()
 
+    base_por_cpf = {
+        pessoa.cpf: pessoa
+        for pessoa in base_total
+        if cpf_valido(pessoa.cpf)
+    }
+    pendentes_por_cpf = {
+        pessoa.cpf: pessoa
+        for pessoa in pendentes
+        if cpf_valido(pessoa.cpf)
+    }
+
     for item_invalido in ULTIMOS_ITENS_INVALIDOS:
         cpf = item_invalido["cpf"]
         auditoria.append({
+            "id": item_invalido["id"],
             "cpf": cpf,
-            "historico": classificar_historico(cpf, concluidos, tecnicos),
+            "nome": item_invalido["nome"],
+            "aba_atual": "Pendentes",
+            "historico_4_operadores": classificar_historico(
+                cpf,
+                concluidos,
+                tecnicos,
+            ),
+            "dados_validos": "NÃO",
             "acao": "ITEM_API_INVALIDO",
             "observacao": item_invalido["observacao"],
         })
 
-    for pessoa in pendentes:
-        cpf = pessoa.cpf
+    for cpf, referencia_base in base_por_cpf.items():
         historico = classificar_historico(cpf, concluidos, tecnicos)
-        contagem[f"historico_{historico}"] += 1
+        pessoa = pendentes_por_cpf.get(cpf)
+
+        if pessoa is None:
+            auditoria.append({
+                "id": str(referencia_base.crm_id or ""),
+                "cpf": cpf,
+                "nome": referencia_base.nome,
+                "aba_atual": "FORA_DE_PENDENTES",
+                "historico_4_operadores": historico,
+                "dados_validos": "NÃO APLICÁVEL",
+                "acao": "ENCERRADO_ESTADO_ATUAL",
+                "observacao": (
+                    "CPF não está na fotografia atual de Pendentes; "
+                    "o estado atual do CRM prevalece sobre o CSV."
+                ),
+            })
+            contagem["fora_de_pendentes"] += 1
+            continue
+
+        contagem[f"pendente_{historico}"] += 1
         valido, problema = dados_minimos_validos(pessoa)
 
         if not valido:
             contagem["dados_insuficientes"] += 1
             auditoria.append({
+                "id": str(pessoa.crm_id or ""),
                 "cpf": cpf,
-                "historico": historico,
+                "nome": pessoa.nome,
+                "aba_atual": "Pendentes",
+                "historico_4_operadores": historico,
+                "dados_validos": "NÃO",
                 "acao": "DADOS_INSUFICIENTES",
                 "observacao": f"Campos ausentes ou inválidos: {problema}.",
             })
             continue
 
         fila.append(pessoa)
-
-        if historico == "FALHA_TECNICA":
-            contagem["fila_FALHA_TECNICA"] += 1
-
-        elif historico == "CONCLUIDO_MAS_AINDA_PENDENTE":
-            contagem["fila_CONCLUIDO_PENDENTE"] += 1
-
-        else:
-            contagem["fila_NOVO"] += 1
-
         contagem["fila"] += 1
 
         auditoria.append({
+            "id": str(pessoa.crm_id or ""),
             "cpf": cpf,
-            "historico": historico,
+            "nome": pessoa.nome,
+            "aba_atual": "Pendentes",
+            "historico_4_operadores": historico,
+            "dados_validos": "SIM",
             "acao": "PROCESSAR",
             "observacao": "",
         })
+
+    for cpf, pessoa in pendentes_por_cpf.items():
+        if cpf in base_por_cpf:
+            continue
+        auditoria.append({
+            "id": str(pessoa.crm_id or ""),
+            "cpf": cpf,
+            "nome": pessoa.nome,
+            "aba_atual": "Pendentes",
+            "historico_4_operadores": classificar_historico(
+                cpf,
+                concluidos,
+                tecnicos,
+            ),
+            "dados_validos": "NÃO APLICÁVEL",
+            "acao": "FORA_DA_BASE_TOTAL",
+            "observacao": (
+                "CPF apareceu em Pendentes, mas não existe na fotografia "
+                "da base total; não foi incluído na fila."
+            ),
+        })
+        contagem["pendente_fora_base"] += 1
 
     return fila, auditoria, contagem
 
@@ -435,17 +508,17 @@ def classificar_historico(
     tecnicos: set[str],
 ) -> str:
     if cpf in concluidos:
-        return "CONCLUIDO_MAS_AINDA_PENDENTE"
+        return "CONCLUIDO"
     if cpf in tecnicos:
         return "FALHA_TECNICA"
-    return "NOVO"
+    return "NAO_PASSOU_NOS_4_OPERADORES"
 
 
 def origem_historico(historico: str) -> str:
     return {
-        "NOVO": "novo",
         "FALHA_TECNICA": "falha_tecnica",
-        "CONCLUIDO_MAS_AINDA_PENDENTE": "concluido_ainda_pendente",
+        "CONCLUIDO": "concluido_ainda_pendente",
+        "NAO_PASSOU_NOS_4_OPERADORES": "nao_passou_nos_4_operadores",
     }[historico]
 
 # ------------------------------------------------------------
@@ -537,6 +610,16 @@ def executar() -> int:
 
             print()
             print(
+                "Fotografando a base total pela API autenticada do CRM..."
+            )
+            base_total = bot.inventariar_eleitores_api(crm)
+            if not base_total:
+                raise RuntimeError(
+                    "A API /cadastrante/api/eleitores não devolveu uma base utilizável."
+                )
+
+            print()
+            print(
                 "Fotografando todos os Pendentes "
                 "pela API autenticada do CRM..."
             )
@@ -551,6 +634,7 @@ def executar() -> int:
 
             fila, auditoria, contagem = (
                 montar_fila(
+                    base_total,
                     pendentes,
                     concluidos,
                     tecnicos,
@@ -561,8 +645,12 @@ def executar() -> int:
                 AUDITORIA_CSV,
                 auditoria,
                 [
+                    "id",
                     "cpf",
-                    "historico",
+                    "nome",
+                    "aba_atual",
+                    "historico_4_operadores",
+                    "dados_validos",
                     "acao",
                     "observacao",
                 ],
@@ -572,6 +660,7 @@ def executar() -> int:
                 FILA_CSV,
                 [
                     {
+                        "id": str(p.crm_id or ""),
                         "cpf": p.cpf,
                         "nome": p.nome,
                         "mae": p.mae,
@@ -587,6 +676,7 @@ def executar() -> int:
                     for p in fila
                 ],
                 [
+                    "id",
                     "cpf",
                     "nome",
                     "mae",
@@ -600,42 +690,77 @@ def executar() -> int:
             print(" RESULTADO DA VARREDURA")
             print("=" * 72)
 
+            realizados = concluidos | tecnicos
+            cpfs_base = {
+                pessoa.cpf
+                for pessoa in base_total
+                if cpf_valido(pessoa.cpf)
+            }
+
             print(
-                f"Pendentes retornados pela API: "
+                f"Total da base:                       "
+                f"{len(base_total)}"
+            )
+
+            print(
+                f"CPFs realizados nos 4 operadores:   "
+                f"{len(realizados)}"
+            )
+
+            print(
+                f"Residual inicial pelo histórico:    "
+                f"{len(cpfs_base - realizados)}"
+            )
+
+            print(
+                f"Pendentes atuais:                    "
                 f"{ULTIMO_TOTAL_PENDENTES_API}"
             )
 
             print(
-                f"Itens inválidos ignorados:     "
+                f"Itens inválidos ignorados:           "
                 f"{len(ULTIMOS_ITENS_INVALIDOS)}"
             )
 
             print("-" * 72)
 
             print(
-                f"Novos:                        "
-                f"{contagem['historico_NOVO']}"
+                f"Pendentes que falharam tecnicamente: "
+                f"{contagem['pendente_FALHA_TECNICA']}"
             )
 
             print(
-                f"Falhas técnicas:              "
-                f"{contagem['historico_FALHA_TECNICA']}"
+                f"Concluídos mas ainda Pendentes:      "
+                f"{contagem['pendente_CONCLUIDO']}"
             )
 
             print(
-                f"Concluídos ainda Pendentes:   "
-                f"{contagem['historico_CONCLUIDO_MAS_AINDA_PENDENTE']}"
+                f"Não passaram nos 4 operadores:       "
+                f"{contagem['pendente_NAO_PASSOU_NOS_4_OPERADORES']}"
             )
 
             print(
-                f"Dados insuficientes:          "
+                f"Dados insuficientes:                 "
                 f"{contagem['dados_insuficientes']}"
+            )
+
+            print(
+                f"Pendentes fora da base total:        "
+                f"{contagem['pendente_fora_base']}"
             )
 
             print()
             print(
-                f"FILA REAL:                    "
+                f"FILA REAL:                           "
                 f"{len(fila)}"
+            )
+
+            print()
+            print(
+                "Demais abas não consultadas: os valores exatos do parâmetro "
+                "'aba' ainda precisam ser confirmados para "
+                + ", ".join(ABAS_CRM_API_AGUARDANDO_CONFIRMACAO)
+                + "."
             )
 
             print()
