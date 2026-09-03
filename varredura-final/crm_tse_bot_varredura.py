@@ -68,6 +68,12 @@ TERMOS_ERRO_TECNICO = (
     "FALHA TÉCNICA",
 )
 
+PADRAO_CPF_BOT_ERROR = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"\s*\|\s*CPF\s+(\d{11})\s*\|\s*tentativa\s+\d+\s*$",
+    re.IGNORECASE,
+)
+
 PASTA_ATUAL = Path(__file__).resolve().parent
 RAIZ = PASTA_ATUAL.parent
 
@@ -164,17 +170,18 @@ def registro_tecnico(linha: dict[str, str]) -> bool:
     return any(termo in texto for termo in TERMOS_ERRO_TECNICO)
 
 
-def ler_historico() -> tuple[set[str], set[str], Counter]:
+def ler_historico() -> tuple[set[str], set[str], set[str], Counter]:
     """
     concluídos:
         consulta teve resposta conclusiva.
         Inclui TSE encontrado e "Não achei" verdadeiro.
 
     tecnicos:
-        consulta não chegou a concluir por CAPTCHA, timeout etc.
+        consulta não chegou a concluir por CAPTCHA, timeout etc.,
+        registrado no CSV ou no bot_error.log.
 
-    Se um CPF falhou primeiro mas depois teve resposta conclusiva,
-    a conclusão vence.
+    Qualquer conclusão registrada no CSV vence erros anteriores e também
+    evita que um erro posterior de inativação rebaixe o CPF para falha.
     """
 
     concluidos: set[str] = set()
@@ -220,10 +227,47 @@ def ler_historico() -> tuple[set[str], set[str], Counter]:
                 else:
                     concluidos.add(cpf)
 
-    # Uma conclusão posterior é definitiva.
+    realizados_csv = concluidos | tecnicos
+    contadores["cpfs_csv"] = len(realizados_csv)
+    erros_log: set[str] = set()
+
+    for operador in range(TOTAL_OPERADORES):
+        caminho = (
+            PASTA_OPERADORES
+            / f"operador-{operador}"
+            / "bot_error.log"
+        )
+
+        print(f"Lendo erros do operador {operador}: {caminho}")
+
+        if not caminho.exists():
+            print("  AVISO: bot_error.log não encontrado.")
+            contadores["log_ausente"] += 1
+            continue
+
+        with caminho.open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as arquivo:
+            for linha in arquivo:
+                correspondencia = PADRAO_CPF_BOT_ERROR.match(linha.strip())
+                if not correspondencia:
+                    continue
+                erros_log.add(correspondencia.group(1))
+                contadores["linhas_erro_log"] += 1
+
+    contadores["cpfs_erro_log"] = len(erros_log)
+    erros_sem_conclusao = erros_log - concluidos
+    contadores["cpfs_erro_log_sem_conclusao"] = len(erros_sem_conclusao)
+    contadores["cpfs_adicionados_pelo_log"] = len(erros_sem_conclusao - tecnicos)
+    tecnicos.update(erros_sem_conclusao)
+
+    # Uma conclusão no CSV é definitiva. Isso também protege o caso em que
+    # o local foi salvo e somente a inativação posterior gerou bot_error.log.
     tecnicos -= concluidos
 
-    return concluidos, tecnicos, contadores
+    return concluidos, tecnicos, realizados_csv, contadores
 
 
 # ------------------------------------------------------------
@@ -556,7 +600,7 @@ def executar() -> int:
     print(" CRM x TSE - VARREDURA FINAL")
     print("=" * 72)
 
-    concluidos, tecnicos, hist = ler_historico()
+    concluidos, tecnicos, realizados_csv, hist = ler_historico()
 
     print()
     print(
@@ -570,6 +614,14 @@ def executar() -> int:
     print(
         f"CPFs com falha técnica:        "
         f"{len(tecnicos)}"
+    )
+    print(
+        f"CPFs encontrados nos logs:     "
+        f"{hist['cpfs_erro_log']}"
+    )
+    print(
+        f"Falhas acrescentadas pelos logs: "
+        f"{hist['cpfs_adicionados_pelo_log']}"
     )
 
     try:
@@ -690,7 +742,6 @@ def executar() -> int:
             print(" RESULTADO DA VARREDURA")
             print("=" * 72)
 
-            realizados = concluidos | tecnicos
             cpfs_base = {
                 pessoa.cpf
                 for pessoa in base_total
@@ -704,12 +755,17 @@ def executar() -> int:
 
             print(
                 f"CPFs realizados nos 4 operadores:   "
-                f"{len(realizados)}"
+                f"{len(realizados_csv)}"
+            )
+
+            print(
+                f"CPFs únicos nos bot_error.log:      "
+                f"{hist['cpfs_erro_log']}"
             )
 
             print(
                 f"Residual inicial pelo histórico:    "
-                f"{len(cpfs_base - realizados)}"
+                f"{len(cpfs_base - realizados_csv)}"
             )
 
             print(
