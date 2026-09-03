@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 set "TSE_URL=https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/"
 

@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 cd /d "%~dp0"
 
@@ -24,7 +24,6 @@ if "%~1"=="" (
 
 set "OPERADOR=%~1"
 title VARREDURA FINAL MULTI - OPERADOR %OPERADOR%
-call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" "varredura-final-multi\crm_tse_bot_varredura_multi.py" "%OPERADOR%"
@@ -34,6 +33,5 @@ if exist ".venv\Scripts\python.exe" (
     echo Ambiente Python nao encontrado. Instale as dependencias na pasta principal.
 )
 
-call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 pause

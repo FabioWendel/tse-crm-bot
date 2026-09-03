@@ -1,2 +1,2 @@
-@echo off
+﻿@echo off
 call "%~dp0INICIAR-OPERADOR.cmd" 3

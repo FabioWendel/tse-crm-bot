@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 cd /d "%~dp0"
 
@@ -26,7 +26,6 @@ if "%~1"=="" (
 
 set "OPERADOR=%~1"
 title RECUPERACAO SEGURA - OPERADOR %OPERADOR%
-call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" "recuperar-rodada\crm_tse_bot_executar_recuperacao.py" "%OPERADOR%"
@@ -36,6 +35,5 @@ if exist ".venv\Scripts\python.exe" (
     echo Ambiente Python nao encontrado. Instale as dependencias na pasta principal.
 )
 
-call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 pause

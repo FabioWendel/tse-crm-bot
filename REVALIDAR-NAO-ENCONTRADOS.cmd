@@ -1,7 +1,6 @@
-@echo off
+﻿@echo off
 setlocal
 cd /d "%~dp0"
-call "%~dp0scripts\focus_shield_client.cmd" start "%~dp0"
 
 title REVALIDACAO DE NAO ENCONTRADOS
 
@@ -34,6 +33,5 @@ if exist ".venv\Scripts\python.exe" (
     echo Ambiente Python nao encontrado. Instale as dependencias na pasta principal.
 )
 
-call "%~dp0scripts\focus_shield_client.cmd" stop
 echo.
 pause
